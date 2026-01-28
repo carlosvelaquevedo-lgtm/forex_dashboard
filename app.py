@@ -403,53 +403,123 @@ def fetch_data(symbol: str, interval: str) -> Optional[pd.DataFrame]:
     """Fetch OHLC data with OANDA primary, yfinance fallback."""
     instrument = INSTRUMENT_MAP.get(symbol)
     df = None
+    error_msg = None
 
     interval_map = {
         "1d": {"gran": "D", "yf_interval": "1d", "yf_period": "2y"},
-        "4h": {"gran": "H4", "yf_interval": "4h", "yf_period": "60d"},
-        "1h": {"gran": "H1", "yf_interval": "1h", "yf_period": "730d"},
+        "4h": {"gran": "H4", "yf_interval": "1h", "yf_period": "60d"},
+        "1h": {"gran": "H1", "yf_interval": "1h", "yf_period": "60d"},
         "5m": {"gran": "M5", "yf_interval": "5m", "yf_period": "5d"},
     }
 
     settings = interval_map.get(interval, {"gran": "D", "yf_interval": "1d", "yf_period": "2y"})
 
+    # Try OANDA first
     if st.session_state.oanda_api and instrument:
         try:
-            params = {"count": 1500, "granularity": settings["gran"], "price": "M"}
+            params = {
+                "count": 500,  # Reduced from 1500 to avoid timeout
+                "granularity": settings["gran"],
+                "price": "M"
+            }
             r = InstrumentsCandles(instrument=instrument, params=params)
             resp = st.session_state.oanda_api.request(r)
-            rows = [{
-                "time": pd.to_datetime(c["time"]),
-                "open": float(c["mid"]["o"]),
-                "high": float(c["mid"]["h"]),
-                "low": float(c["mid"]["l"]),
-                "close": float(c["mid"]["c"]),
-            } for c in resp.get("candles", []) if c.get("mid")]
-            if rows:
-                df = pd.DataFrame(rows).set_index("time")
-                df = normalize_to_utc(df)
+            
+            candles = resp.get("candles", [])
+            if candles:
+                rows = []
+                for c in candles:
+                    if c.get("mid") and c.get("complete", True):  # Only use complete candles
+                        rows.append({
+                            "time": pd.to_datetime(c["time"]),
+                            "open": float(c["mid"]["o"]),
+                            "high": float(c["mid"]["h"]),
+                            "low": float(c["mid"]["l"]),
+                            "close": float(c["mid"]["c"]),
+                        })
+                if rows:
+                    df = pd.DataFrame(rows).set_index("time")
+                    df = normalize_to_utc(df)
+                    logger.info(f"OANDA: {symbol} {interval} → {len(df)} bars")
+                else:
+                    error_msg = f"OANDA returned {len(candles)} candles but none were complete/valid"
+            else:
+                error_msg = "OANDA returned no candles"
         except Exception as e:
+            error_msg = str(e)
             logger.warning(f"OANDA fetch failed for {symbol}: {e}")
             df = None
 
+    # Fallback to yfinance
     if df is None or df.empty:
         try:
+            logger.info(f"Trying yfinance for {symbol} interval={settings['yf_interval']} period={settings['yf_period']}")
             df = yf.download(
                 symbol, period=settings["yf_period"],
-                interval=settings["yf_interval"], progress=False
+                interval=settings["yf_interval"], progress=False,
+                timeout=10
             )
-            if df.empty:
+            if df is None or df.empty:
+                logger.warning(f"yfinance returned empty data for {symbol}")
                 return None
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df = df[["Open", "High", "Low", "Close"]].copy()
             df.columns = ["open", "high", "low", "close"]
             df = normalize_to_utc(df)
+            
+            # If we requested 4h but got 1h, resample to 4h
+            if interval == "4h" and settings["yf_interval"] == "1h":
+                df = df.resample("4h").agg({
+                    "open": "first",
+                    "high": "max", 
+                    "low": "min",
+                    "close": "last"
+                }).dropna()
+            
+            logger.info(f"yfinance: {symbol} {interval} → {len(df)} bars")
         except Exception as e:
             logger.warning(f"yfinance fetch failed for {symbol}: {e}")
             return None
 
     return df
+
+
+def test_oanda_connection() -> Dict:
+    """Test OANDA connection and return diagnostic info."""
+    results = {
+        "connected": st.session_state.oanda_available,
+        "api_object": st.session_state.oanda_api is not None,
+        "account_id": st.session_state.oanda_account_id,
+        "test_results": []
+    }
+    
+    if not st.session_state.oanda_api:
+        results["error"] = "No API object"
+        return results
+    
+    # Test with EUR_USD
+    test_instrument = "EUR_USD"
+    try:
+        params = {"count": 10, "granularity": "H4", "price": "M"}
+        r = InstrumentsCandles(instrument=test_instrument, params=params)
+        resp = st.session_state.oanda_api.request(r)
+        candles = resp.get("candles", [])
+        results["test_results"].append({
+            "instrument": test_instrument,
+            "candles_received": len(candles),
+            "status": "✅ OK" if candles else "❌ No data"
+        })
+        if candles:
+            results["sample_candle"] = candles[0]
+    except Exception as e:
+        results["test_results"].append({
+            "instrument": test_instrument,
+            "status": f"❌ Error: {str(e)}"
+        })
+        results["error"] = str(e)
+    
+    return results
 
 
 def fetch_data_for_pair(pair: str, htf: str, ltf: str) -> Tuple[str, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
@@ -1639,6 +1709,52 @@ with st.sidebar:
     if st.button("🔄 Refresh Prices"):
         st.session_state.price_refresh_time = datetime.now()
         st.success("Prices will refresh on next view")
+    
+    st.divider()
+    
+    # Diagnostic section
+    with st.expander("🔧 Diagnostics"):
+        st.write(f"**OANDA Connected:** {st.session_state.oanda_available}")
+        st.write(f"**Account ID:** {st.session_state.oanda_account_id}")
+        st.write(f"**HTF:** {cfg.HTF}, **LTF:** {cfg.LTF}")
+        st.write(f"**MIN_BARS:** {cfg.MIN_BARS}, **MIN_ADX:** {cfg.MIN_ADX}")
+        
+        if st.button("🔌 Test OANDA Connection"):
+            with st.spinner("Testing OANDA..."):
+                test_result = test_oanda_connection()
+                st.json(test_result)
+        
+        if st.button("📊 Test Data Fetch"):
+            st.write("Testing data fetch for all pairs...")
+            results = []
+            for pair in PAIRS:
+                with st.spinner(f"Fetching {pair}..."):
+                    htf = fetch_data(pair, cfg.HTF)
+                    ltf = fetch_data(pair, cfg.LTF)
+                    htf_status = f"✅ {len(htf)} bars" if htf is not None and not htf.empty else "❌ Failed"
+                    ltf_status = f"✅ {len(ltf)} bars" if ltf is not None and not ltf.empty else "❌ Failed"
+                    results.append({
+                        "Pair": pair,
+                        "Instrument": INSTRUMENT_MAP.get(pair, "?"),
+                        f"HTF ({cfg.HTF})": htf_status,
+                        f"LTF ({cfg.LTF})": ltf_status
+                    })
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
+        
+        if st.button("🧪 Test Single Pair (EUR_USD)"):
+            with st.spinner("Testing EUR_USD..."):
+                st.write("**Testing OANDA H4 fetch for EUR_USD...**")
+                try:
+                    params = {"count": 10, "granularity": "H4", "price": "M"}
+                    r = InstrumentsCandles(instrument="EUR_USD", params=params)
+                    resp = st.session_state.oanda_api.request(r)
+                    candles = resp.get("candles", [])
+                    st.write(f"Received {len(candles)} candles")
+                    if candles:
+                        st.write("**Sample candle:**")
+                        st.json(candles[0])
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 # Main tabs
 tab1, tab2, tab3, tab4 = st.tabs(["📈 Live", "📊 Backtest", "📋 Signals", "📉 Stats"])

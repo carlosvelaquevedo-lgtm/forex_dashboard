@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, Set, Optional
 import logging
 import time
+from contextlib import contextmanager             # ← Added this line
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)

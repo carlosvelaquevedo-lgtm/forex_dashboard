@@ -66,7 +66,7 @@ class Config:
     SLIPPAGE_PIPS: float = 0.5  # Typical slippage in pips
     MAX_HOLD_DAYS: int = 30  # Max days to hold a trade in backtest
     # v4: Parallel scanning
-    ENABLE_PARALLEL_SCAN: bool = True
+    ENABLE_PARALLEL_SCAN: bool = False  # Disabled: st.session_state not accessible in threads
     MAX_WORKERS: int = 4
 
     def to_dict(self):

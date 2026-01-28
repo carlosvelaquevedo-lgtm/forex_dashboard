@@ -257,39 +257,83 @@ def run_scan():
 # ────────────────────────────────────────────────
 # HISTORICAL SCAN + HEATMAP (FIXED)
 # ────────────────────────────────────────────────
-
 def run_historical_scan(lookback_days: int):
-    cfg = get_config()
-    rejections = {}
     signals = []
+    rejections = {}
 
-    def reject(reason):
-        rejections[reason] = rejections.get(reason, 0) + 1
+    for pair in Config.PAIRS:
+        rejections[pair] = {}
 
-    for symbol in PAIRS:
-        htf = fetch_with_indicators(symbol, "1y", "1d")
-        ltf = fetch_with_indicators(symbol, "6mo", "4h")
-        if htf is None or ltf is None:
-            continue
+        try:
+            htf = fetch_data(pair, Config.HTF)
+            ltf = fetch_data(pair, Config.LTF)
 
-        ltf["bull"] = (ltf["ema_fast"] > ltf["ema_slow"]) & (ltf["ema_fast"].shift() <= ltf["ema_slow"].shift())
-        ltf["bear"] = (ltf["ema_fast"] < ltf["ema_slow"]) & (ltf["ema_fast"].shift() >= ltf["ema_slow"].shift())
-
-        recent = ltf[ltf.index >= ltf.index[-1] - pd.Timedelta(days=lookback_days)]
-
-        for idx, row in recent.iterrows():
-            if row["adx"] < cfg.MIN_ADX:
-                reject("ADX too low")
-                continue
-            if row["atr"] / row["close"] * 100 < cfg.MIN_ATR_RATIO_PCT:
-                reject("ATR too low")
+            # ─────────────────────────────────────────
+            # HARD DATA GUARDS
+            # ─────────────────────────────────────────
+            if htf is None or ltf is None:
+                rejections[pair]["no_data"] = rejections[pair].get("no_data", 0) + 1
                 continue
 
-            signals.append({
-                "symbol": symbol,
-                "time": idx,
-                "adx": round(row["adx"], 1)
-            })
+            if htf.empty or ltf.empty:
+                rejections[pair]["empty_df"] = rejections[pair].get("empty_df", 0) + 1
+                continue
+
+            # Ensure datetime index
+            if not isinstance(ltf.index, pd.DatetimeIndex):
+                ltf.index = pd.to_datetime(ltf.index, errors="coerce")
+
+            ltf = ltf.sort_index()
+            htf = htf.sort_index()
+
+            if ltf.index.isna().all():
+                rejections[pair]["bad_index"] = rejections[pair].get("bad_index", 0) + 1
+                continue
+
+            if len(ltf) < Config.MIN_BARS or len(htf) < Config.MIN_BARS:
+                rejections[pair]["not_enough_bars"] = rejections[pair].get("not_enough_bars", 0) + 1
+                continue
+            # ─────────────────────────────────────────
+
+            htf = compute_indicators(htf)
+            ltf = compute_indicators(ltf)
+
+            # Drop NaNs AFTER indicators
+            ltf = ltf.dropna()
+            htf = htf.dropna()
+
+            if ltf.empty:
+                rejections[pair]["nan_after_indicators"] = rejections[pair].get("nan_after_indicators", 0) + 1
+                continue
+
+            # ─────────────────────────────────────────
+            # SAFE LOOKBACK WINDOW
+            # ─────────────────────────────────────────
+            last_ts = ltf.index.max()
+            cutoff = last_ts - pd.Timedelta(days=lookback_days)
+
+            recent = ltf[ltf.index >= cutoff]
+
+            if recent.empty:
+                rejections[pair]["no_recent_data"] = rejections[pair].get("no_recent_data", 0) + 1
+                continue
+            # ─────────────────────────────────────────
+
+            for i in range(len(recent)):
+                sub_ltf = recent.iloc[: i + 1]
+                sub_htf = htf[htf.index <= sub_ltf.index[-1]]
+
+                if sub_htf.empty:
+                    rejections[pair]["no_htf_alignment"] = rejections[pair].get("no_htf_alignment", 0) + 1
+                    continue
+
+                signal = generate_signal(sub_htf, sub_ltf)
+                if signal:
+                    signals.append(signal)
+
+        except Exception as e:
+            rejections[pair]["exception"] = rejections[pair].get("exception", 0) + 1
+            logger.exception(f"{pair}: historical scan failed → {e}")
 
     return signals, rejections
 

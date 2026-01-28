@@ -1,6 +1,6 @@
 # app.py — Trading Scanner Dashboard with Streamlit + SQLite + OANDA/yfinance
 # Primary: OANDA v20 API for candles; fallback to yfinance
-# Enhanced: pullbacks, HTF momentum, configurable filters, safety checks
+# Fixed UI: reliable sidebar rendering with all controls visible
 
 import streamlit as st
 import pandas as pd
@@ -85,10 +85,11 @@ def get_config() -> Config:
     return Config.from_dict(st.session_state.config)
 
 def update_config(**kwargs):
-    st.session_state.config.update(kwargs)
+    for k, v in kwargs.items():
+        st.session_state.config[k] = v
 
 # ────────────────────────────────────────────────
-# DATABASE (unchanged)
+# DATABASE
 # ────────────────────────────────────────────────
 
 @contextmanager
@@ -165,9 +166,10 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
         log.warning(f"No OANDA instrument mapped for {symbol}")
         return None
 
-    # Try OANDA first
     api = st.session_state.oanda_api
     df = None
+
+    # Try OANDA
     if api:
         try:
             granularity_map = {"1d": "D", "4h": "H4"}
@@ -175,8 +177,8 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
                 raise ValueError(f"Unsupported interval: {interval}")
             granularity = granularity_map[interval]
 
-            count_map = {"1y_1d": 600, "6mo_4h": 2000}
-            count = count_map.get(f"{period}_{interval}", 1000)
+            count_map = {"1y": 600, "6mo": 2000}
+            count = count_map.get(period.split("mo")[0] + "mo" if "mo" in period else period, 1000)
 
             params = {
                 "count": count,
@@ -196,44 +198,38 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
                 mid = c.get("mid")
                 if mid:
                     rows.append({
+                        "time": pd.to_datetime(c["time"]),
                         "open": float(mid["o"]),
                         "high": float(mid["h"]),
                         "low": float(mid["l"]),
                         "close": float(mid["c"]),
-                        "time": c["time"],
                     })
 
-            df = pd.DataFrame(rows)
-            df["time"] = pd.to_datetime(df["time"])
-            df.set_index("time", inplace=True)
-            df = df[["open", "high", "low", "close"]]
-            log.info(f"Fetched {len(df)} candles from OANDA for {instrument} ({period}, {interval})")
-        except (V20Error, Exception) as e:
-            log.warning(f"OANDA fetch failed for {instrument}: {e} — falling back to yfinance")
+            df = pd.DataFrame(rows).set_index("time")
+            log.info(f"OANDA → {len(df)} candles for {instrument} ({period}, {interval})")
+        except Exception as e:
+            log.warning(f"OANDA fetch failed: {e} → falling back to yfinance")
 
-    # Fallback to yfinance if OANDA failed or not available
+    # Fallback to yfinance
     if df is None or df.empty:
         try:
             df = yf.download(symbol, period=period, interval=interval, progress=False)
-            if df.empty:
-                log.warning(f"yfinance empty for {symbol}")
-                return None
-            df = df[['Open','High','Low','Close']].copy()
-            df.columns = ['open','high','low','close']
-            log.info(f"Fallback: Fetched from yfinance for {symbol}")
+            if not df.empty:
+                df = df[['Open','High','Low','Close']].copy()
+                df.columns = ['open','high','low','close']
+                df.index = pd.to_datetime(df.index)
+                log.info(f"yfinance fallback → {len(df)} rows for {symbol}")
         except Exception as e:
-            log.error(f"yfinance fallback failed for {symbol}: {e}")
+            log.error(f"yfinance failed: {e}")
             return None
 
     if df is None or df.empty:
         return None
 
-    # ─── Indicators (same as original) ───
-    # EMAs
+    # Indicators
     for span, name in [(9,'ema_fast'), (21,'ema_slow'), (50,'ema_tf'), (200,'ema_ts')]:
         df[name] = df['close'].ewm(span=span, adjust=False).mean()
 
-    # ATR
     tr = pd.concat([
         df['high'] - df['low'],
         (df['high'] - df['close'].shift()).abs(),
@@ -241,7 +237,6 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
     ], axis=1).max(axis=1)
     df['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # ADX + DI
     up = df['high'].diff()
     down = -df['low'].diff()
     plus_dm = np.where((up > down) & (up > 0), up, 0)
@@ -255,7 +250,6 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
     df['plus_di'] = plus_di
     df['minus_di'] = minus_di
 
-    # RSI
     delta = df['close'].diff()
     gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(span=14, adjust=False).mean()
@@ -264,47 +258,352 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
 
     df = df.dropna()
     if df.empty:
-        log.warning(f"No valid rows after dropna for {symbol} ({period}, {interval})")
         return None
 
     return df
 
 # ────────────────────────────────────────────────
-# SIGNAL ENGINE (unchanged)
+# SIGNAL ENGINE
 # ────────────────────────────────────────────────
-# ... (your find_signal function remains the same; it uses the df from fetch)
+
+def find_signal(symbol: str, htf: pd.DataFrame, ltf: pd.DataFrame, seen: Set[str], config: Config) -> Optional[Dict]:
+    if len(htf) < 200 or len(ltf) < 50:
+        return None
+
+    last_htf = htf.iloc[-1]
+
+    trend = None
+    if last_htf['close'] > last_htf['ema_tf'] > last_htf['ema_ts']:
+        trend = "UP"
+    elif last_htf['close'] < last_htf['ema_tf'] < last_htf['ema_ts']:
+        trend = "DOWN"
+    if not trend:
+        return None
+
+    if trend == "UP" and last_htf['ema_fast'] < last_htf['ema_slow']:
+        return None
+    if trend == "DOWN" and last_htf['ema_fast'] > last_htf['ema_slow']:
+        return None
+
+    min_adx = config.MIN_ADX * (0.65 if config.AGGRESSIVE_MODE else 1.0)
+    min_atr_pct = config.MIN_ATR_RATIO_PCT * (0.6 if config.AGGRESSIVE_MODE else 1.0)
+    max_age = config.MAX_SIGNAL_AGE_DAYS * (2.5 if config.AGGRESSIVE_MODE else 1.0)
+
+    ltf = ltf.copy()
+    ltf['bull_cross'] = (ltf['ema_fast'] > ltf['ema_slow']) & (ltf['ema_fast'].shift(1) <= ltf['ema_slow'].shift(1))
+    ltf['bear_cross'] = (ltf['ema_fast'] < ltf['ema_slow']) & (ltf['ema_fast'].shift(1) >= ltf['ema_slow'].shift(1))
+
+    mask = ltf['bull_cross'] if trend == "UP" else ltf['bear_cross']
+    crosses = ltf[mask]
+    if crosses.empty:
+        return None
+
+    sig_idx = crosses.index[-1]
+    sig = ltf.loc[sig_idx]
+
+    age_days = (ltf.index[-1] - sig_idx).total_seconds() / 86400
+    if age_days > max_age:
+        return None
+
+    if sig['adx'] < min_adx:
+        return None
+    if (sig['atr'] / sig['close']) * 100 < min_atr_pct:
+        return None
+
+    if config.ENABLE_DI_CONFIRM:
+        if trend == "UP" and sig['plus_di'] <= sig['minus_di']:
+            return None
+        if trend == "DOWN" and sig['minus_di'] <= sig['plus_di']:
+            return None
+
+    if config.ENABLE_RSI_FILTER:
+        if trend == "UP" and sig['rsi'] > 70:
+            return None
+        if trend == "DOWN" and sig['rsi'] < 30:
+            return None
+
+    if config.ENABLE_PULLBACK_FILTER:
+        dist_to_ema = abs(sig['close'] - sig['ema_fast']) / sig['atr']
+        if dist_to_ema > config.PULLBACK_ATR_MAX:
+            return None
+
+    if abs(sig['close'] - sig['ema_slow']) / sig['atr'] > 2.0:
+        return None
+
+    pos = ltf.index.get_loc(sig_idx)
+    if pos + 1 >= len(ltf):
+        return None
+    entry = float(ltf.iloc[pos + 1]['open'])
+
+    atr = sig['atr']
+    instrument = INSTRUMENT_MAP[symbol]
+    sl_mult = 1.2 if instrument == "XAU_USD" else config.ATR_SL_MULT
+
+    if trend == "UP":
+        sl = entry - atr * sl_mult
+        tp = entry + (entry - sl) * config.TARGET_RR
+        direction = "LONG"
+    else:
+        sl = entry + atr * sl_mult
+        tp = entry - (sl - entry) * config.TARGET_RR
+        direction = "SHORT"
+
+    units = 1000  # placeholder - consider implementing real sizing
+
+    confidence = min(
+        sig['adx'] +
+        (sig['plus_di'] - sig['minus_di'] if trend == "UP" else sig['minus_di'] - sig['plus_di']) * 0.5 +
+        (10 if 40 < sig['rsi'] < 60 else 0) -
+        (10 if sig['adx'] > 45 else 0),
+        100
+    )
+
+    sid = f"{symbol}_{sig_idx.strftime('%Y%m%d_%H%M')}_{direction}"
+    if sid in seen:
+        return None
+    seen.add(sid)
+
+    return {
+        "id": sid,
+        "symbol_raw": symbol,
+        "instrument": instrument,
+        "direction": direction,
+        "entry": entry,
+        "sl": float(sl),
+        "tp": float(tp),
+        "units": units,
+        "open_time": datetime.now(timezone.utc).isoformat(),
+        "confidence": round(confidence, 1)
+    }
 
 # ────────────────────────────────────────────────
-# HISTORICAL + NEAR-MISS SCAN (unchanged)
+# HISTORICAL + NEAR-MISS SCAN
 # ────────────────────────────────────────────────
-# ... (run_historical_scan unchanged)
+
+def run_historical_scan(lookback_days: int, show_near_misses: bool) -> list:
+    cfg = get_config()
+    all_opps = []
+    seen = set()
+
+    df_existing = load_signals()
+    existing_ids = set(df_existing['id']) if not df_existing.empty else set()
+
+    skipped = []
+
+    for symbol in PAIRS:
+        htf = fetch_with_indicators(symbol, "1y", "1d")
+        ltf = fetch_with_indicators(symbol, "6mo", "4h")
+
+        if htf is None or ltf is None:
+            skipped.append(symbol)
+            continue
+
+        if len(ltf) < 10:
+            log.info(f"Skipping {symbol} — LTF has only {len(ltf)} rows")
+            skipped.append(symbol)
+            continue
+
+        now = ltf.index[-1]
+        ltf_recent = ltf[ltf.index >= now - pd.Timedelta(days=lookback_days + 1)]
+
+        if ltf_recent.empty:
+            skipped.append(symbol)
+            continue
+
+        ltf_recent = ltf_recent.copy()
+        ltf_recent['bull_cross'] = (ltf_recent['ema_fast'] > ltf_recent['ema_slow']) & \
+                                   (ltf_recent['ema_fast'].shift(1) <= ltf_recent['ema_slow'].shift(1))
+        ltf_recent['bear_cross'] = (ltf_recent['ema_fast'] < ltf_recent['ema_slow']) & \
+                                   (ltf_recent['ema_fast'].shift(1) >= ltf_recent['ema_slow'].shift(1))
+
+        crosses = ltf_recent[ltf_recent['bull_cross'] | ltf_recent['bear_cross']]
+
+        for idx, row in crosses.iterrows():
+            trend = "UP" if row['bull_cross'] else "DOWN"
+            sig_time = idx
+
+            pos = ltf.index.get_loc(idx)
+            if pos + 1 >= len(ltf):
+                continue
+            entry = float(ltf.iloc[pos + 1]['open'])
+
+            age_days = (now - sig_time).total_seconds() / 86400
+
+            # Strict signal attempt
+            strict_sig = find_signal(symbol, htf, ltf, seen | existing_ids, cfg)
+
+            if strict_sig:
+                status = "New Signal" if strict_sig['id'] not in existing_ids else "Existing"
+                all_opps.append({
+                    **strict_sig,
+                    "status": status,
+                    "age_days": round(age_days, 1),
+                    "cross_time": sig_time.strftime('%Y-%m-%d %H:%M')
+                })
+                continue
+
+            if not show_near_misses:
+                continue
+
+            if age_days > cfg.MAX_SIGNAL_AGE_DAYS * 2:
+                continue
+
+            last_htf = htf.iloc[-1]
+            if trend == "UP" and not (last_htf['close'] > last_htf['ema_tf'] > last_htf['ema_ts']):
+                continue
+            if trend == "DOWN" and not (last_htf['close'] < last_htf['ema_tf'] < last_htf['ema_ts']):
+                continue
+
+            atr = row['atr']
+            instrument = INSTRUMENT_MAP[symbol]
+            sl_mult = 1.2 if instrument == "XAU_USD" else cfg.ATR_SL_MULT
+
+            if trend == "UP":
+                sl = entry - atr * sl_mult
+                tp = entry + (entry - sl) * cfg.TARGET_RR
+                direction = "LONG"
+            else:
+                sl = entry + atr * sl_mult
+                tp = entry - (sl - entry) * cfg.TARGET_RR
+                direction = "SHORT"
+
+            sid = f"{symbol}_{sig_time.strftime('%Y%m%d_%H%M')}_{direction}_near"
+
+            all_opps.append({
+                "id": sid,
+                "symbol_raw": symbol,
+                "direction": direction,
+                "entry": entry,
+                "sl": float(sl),
+                "tp": float(tp),
+                "open_time": datetime.now(timezone.utc).isoformat(),
+                "confidence": 30.0,
+                "status": "Near-miss (relaxed filters)",
+                "age_days": round(age_days, 1),
+                "cross_time": sig_time.strftime('%Y-%m-%d %H:%M'),
+                "failed_filters": "Strict ADX/ATR/DI/RSI/Pullback not met"
+            })
+
+    if skipped:
+        st.caption(f"Skipped due to missing/insufficient data: {', '.join(skipped)}")
+
+    return sorted(all_opps, key=lambda x: x.get('age_days', 999))
 
 # ────────────────────────────────────────────────
-# LIVE SCAN (unchanged)
+# LIVE SCAN
 # ────────────────────────────────────────────────
-# ... (run_scan unchanged)
+
+def run_scan():
+    cfg = get_config()
+    df = load_signals()
+    seen = set(df['id']) if not df.empty else set()
+    new_signals = []
+    skipped = []
+
+    for symbol in PAIRS:
+        htf = fetch_with_indicators(symbol, "1y", "1d")
+        ltf = fetch_with_indicators(symbol, "6mo", "4h")
+
+        if htf is None or ltf is None or len(ltf) < 10 or len(htf) < 100:
+            skipped.append(symbol)
+            continue
+
+        sig = find_signal(symbol, htf, ltf, seen, cfg)
+        if sig and save_signal(sig):
+            new_signals.append(sig)
+            seen.add(sig["id"])
+
+    if skipped:
+        st.caption(f"Skipped in live scan due to data issues: {', '.join(skipped)}")
+
+    return new_signals
 
 # ────────────────────────────────────────────────
-# UI (unchanged, but add optional status if needed)
+# UI
 # ────────────────────────────────────────────────
 
 st.set_page_config(page_title="Trend Scanner", layout="wide")
 st.title("📈 Trend Following Scanner")
 
+# ─── SIDEBAR ─────────────────────────────────────
+
 with st.sidebar:
     st.header("Controls")
 
-    # Optional: show OANDA status
-    if st.session_state.oanda_api:
+    if st.session_state.get("oanda_api"):
         st.success("OANDA connected")
     else:
         st.warning("OANDA not connected — using yfinance fallback")
 
-    # ... rest of your sidebar unchanged (Run Scan, filters, historical scan, etc.)
+    st.divider()
 
-# ────────────────────────────────────────────────
-# MAIN CONTENT (unchanged)
-# ────────────────────────────────────────────────
+    if st.button("Run Scan Now", type="primary", use_container_width=True):
+        with st.spinner("Scanning markets..."):
+            new = run_scan()
+            st.session_state.last_scan = datetime.now()
+        if new:
+            st.success(f"Found {len(new)} new signal(s)")
+        else:
+            st.info("No new signals this run")
+
+    if st.session_state.last_scan:
+        age = datetime.now() - st.session_state.last_scan
+        st.caption(f"Last scan: {st.session_state.last_scan.strftime('%H:%M:%S')} ({age.seconds//60} min ago)")
+
+    st.divider()
+    st.subheader("Signal Filters")
+
+    aggressive = st.checkbox(
+        "Aggressive Mode (more signals)",
+        value=get_config().AGGRESSIVE_MODE
+    )
+    update_config(AGGRESSIVE_MODE=aggressive)
+
+    enable_di = st.checkbox(
+        "Require DI Direction",
+        value=get_config().ENABLE_DI_CONFIRM
+    )
+    enable_rsi = st.checkbox(
+        "Skip Extreme RSI",
+        value=get_config().ENABLE_RSI_FILTER
+    )
+    enable_pullback = st.checkbox(
+        "Require Pullback to EMA",
+        value=get_config().ENABLE_PULLBACK_FILTER
+    )
+
+    update_config(
+        ENABLE_DI_CONFIRM=enable_di,
+        ENABLE_RSI_FILTER=enable_rsi,
+        ENABLE_PULLBACK_FILTER=enable_pullback
+    )
+
+    if st.button("Reset Filters"):
+        st.session_state.config = Config().to_dict()
+        st.rerun()
+
+    st.divider()
+    st.subheader("Historical / Debug Scan")
+
+    lookback_days = st.slider("Lookback days for opportunities", 1, 14, 3)
+    show_near_misses = st.checkbox("Show near-miss opportunities", value=True)
+
+    if st.button("Scan Recent + Historical", type="secondary", use_container_width=True):
+        with st.spinner(f"Scanning last {lookback_days} days..."):
+            historical = run_historical_scan(lookback_days, show_near_misses)
+            if historical:
+                st.success(f"Found {len(historical)} opportunities / near-misses")
+                st.dataframe(pd.DataFrame(historical))
+            else:
+                st.info("No crossovers or opportunities found in the lookback period.")
+
+    st.divider()
+    st.subheader("Auto-refresh")
+    if st.checkbox("Auto-refresh every 60s"):
+        time.sleep(60)
+        st.rerun()
+
+# ─── MAIN AREA ───────────────────────────────────
 
 st.header("Saved Signals")
 

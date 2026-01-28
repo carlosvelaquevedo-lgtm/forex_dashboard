@@ -86,13 +86,16 @@ INSTRUMENT_SPECS = {
     "USDCHF=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5},
     "USDCAD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0 / 1.36, "type": "forex", "decimals": 5},
     "GC=F": {"pip_multiplier": 1, "pip_value_per_lot": 100.0, "type": "commodity", "decimals": 2},
-}# yfinance period limits by interval
+}
+# yfinance period limits by interval
 YFINANCE_LIMITS = {
     "1d": {"max_period": "2y", "max_days": 730},
     "4h": {"max_period": "60d", "max_days": 60},
     "1h": {"max_period": "730d", "max_days": 730},
     "15m": {"max_period": "60d", "max_days": 60},
-}DB_FILE = "signals.db"# ────────────────────────────────────────────────
+}
+DB_FILE = "signals.db"
+# ────────────────────────────────────────────────
 # SESSION STATE
 # ────────────────────────────────────────────────
 

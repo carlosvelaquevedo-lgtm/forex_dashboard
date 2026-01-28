@@ -449,7 +449,7 @@ elif specs["type"] == "commodity":
     contracts = int(risk_usd / risk_per_contract)
     return max(contracts, 0)
 
-return 0def format_position_size(symbol: str, units: int) -> str:
+return 0 def format_position_size(symbol: str, units: int) -> str:
     specs = INSTRUMENT_SPECS.get(symbol, {"type": "forex"})
     if specs["type"] == "commodity":
         return f"{units} contract(s)"

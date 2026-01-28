@@ -209,48 +209,50 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
 # ────────────────────────────────────────────────
 # LIVE SCAN
 # ────────────────────────────────────────────────
-
 def run_scan():
-    cfg = get_config()
-    df_existing = load_signals()
-    seen = set(df_existing["id"]) if not df_existing.empty else set()
-    new = []
+    results = []
 
-    for symbol in PAIRS:
-        htf = fetch_with_indicators(symbol, "1y", "1d")
-        ltf = fetch_with_indicators(symbol, "6mo", "4h")
-        if htf is None or ltf is None:
-            continue
+    for pair in Config.PAIRS:
+        try:
+            htf = fetch_data(pair, Config.HTF)
+            ltf = fetch_data(pair, Config.LTF)
 
-        last = ltf.iloc[-1]
-        trend = "UP" if last["ema_fast"] > last["ema_slow"] else "DOWN"
-        entry = last["close"]
-        atr = last["atr"]
+            # ─────────────────────────────────────────
+            # HARD GUARDS (this fixes your crash)
+            # ─────────────────────────────────────────
+            if htf is None or ltf is None:
+                logger.warning(f"{pair}: data fetch returned None")
+                continue
 
-        sl = entry - atr * cfg.ATR_SL_MULT if trend == "UP" else entry + atr * cfg.ATR_SL_MULT
-        tp = entry + (entry - sl) * cfg.TARGET_RR if trend == "UP" else entry - (sl - entry) * cfg.TARGET_RR
+            if htf.empty or ltf.empty:
+                logger.warning(f"{pair}: empty dataframe (htf={len(htf)}, ltf={len(ltf)})")
+                continue
 
-        sid = f"{symbol}_{ltf.index[-1].strftime('%Y%m%d_%H%M')}_{trend}"
-        if sid in seen:
-            continue
+            if len(htf) < Config.MIN_BARS or len(ltf) < Config.MIN_BARS:
+                logger.warning(f"{pair}: not enough bars")
+                continue
+            # ─────────────────────────────────────────
 
-        sig = {
-            "id": sid,
-            "symbol_raw": symbol,
-            "instrument": INSTRUMENT_MAP[symbol],
-            "direction": "LONG" if trend == "UP" else "SHORT",
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "units": 1000,
-            "open_time": datetime.now(timezone.utc).isoformat(),
-            "confidence": round(last["adx"], 1)
-        }
+            htf = compute_indicators(htf)
+            ltf = compute_indicators(ltf)
 
-        save_signal(sig)
-        new.append(sig)
+            # Guard again AFTER indicators (NaNs)
+            if ltf.dropna().empty:
+                logger.warning(f"{pair}: indicators produced NaNs only")
+                continue
 
-    return new
+            last = ltf.iloc[-1]   # ← now safe
+            trend = last["trend"]
+
+            signal = generate_signal(htf, ltf)
+
+            if signal:
+                results.append(signal)
+
+        except Exception as e:
+            logger.exception(f"{pair}: scan failed → {e}")
+
+    return results
 
 # ────────────────────────────────────────────────
 # HISTORICAL SCAN + HEATMAP (FIXED)

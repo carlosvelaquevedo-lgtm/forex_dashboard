@@ -100,7 +100,8 @@ DB_FILE = "signals.db"
 # ────────────────────────────────────────────────
 
 if "config" not in st.session_state:
-    st.session_state.config = Config().to_dict()if "last_scan" not in st.session_state:
+    st.session_state.config = Config().to_dict()
+    if "last_scan" not in st.session_state:
     st.session_state.last_scan = Noneif "last_scan_time" not in st.session_state:
     st.session_state.last_scan_time = Noneif "last_scan_duration" not in st.session_state:
     st.session_state.last_scan_duration = Noneif "oanda_available" not in st.session_state:

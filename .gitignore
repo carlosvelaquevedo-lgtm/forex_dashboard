@@ -1,0 +1,57 @@
+# Python / virtual environments
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+ENV/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Streamlit-specific sensitive files
+.streamlit/secrets.toml
+signals.db
+*.sqlite
+*.db-shm
+*.db-wal
+
+# Byte-compiled / optimized files
+*.egg-info/
+dist/
+build/
+*.egg
+
+# macOS / Windows junk files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Editor / IDE folders
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Dependency directories (if you ever use npm/pipenv/etc.)
+node_modules/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Keep these commented if you ever want to version small data files
+# data/
+# *.csv
+# *.json

@@ -1,6 +1,5 @@
-# app.py — Trading Scanner Dashboard with Streamlit + SQLite + OANDA/yfinance
-# Primary: OANDA v20 API for candles; fallback to yfinance
-# Fixed UI: reliable sidebar rendering with all controls visible
+# app.py — Trend Following Scanner with Streamlit + SQLite + OANDA (primary) / yfinance fallback
+# All pairs: EURUSD, USDJPY, GBPUSD, AUDUSD, USDCHF, USDCAD, XAUUSD (gold)
 
 import streamlit as st
 import pandas as pd
@@ -51,15 +50,23 @@ class Config:
 DB_FILE = "signals.db"
 
 PAIRS = [
-    "EURUSD=X", "USDJPY=X", "GBPUSD=X",
-    "AUDUSD=X", "USDCHF=X", "USDCAD=X",
-    "GC=F"
+    "EURUSD=X",     # EUR/USD
+    "USDJPY=X",     # USD/JPY
+    "GBPUSD=X",     # GBP/USD
+    "AUDUSD=X",     # AUD/USD
+    "USDCHF=X",     # USD/CHF
+    "USDCAD=X",     # USD/CAD
+    "GC=F"          # Gold (XAU/USD)
 ]
 
 INSTRUMENT_MAP = {
-    "EURUSD=X": "EUR_USD", "USDJPY=X": "USD_JPY", "GBPUSD=X": "GBP_USD",
-    "AUDUSD=X": "AUD_USD", "USDCHF=X": "USD_CHF", "USDCAD=X": "USD_CAD",
-    "GC=F": "XAU_USD"
+    "EURUSD=X": "EUR_USD",
+    "USDJPY=X": "USD_JPY",
+    "GBPUSD=X": "GBP_USD",
+    "AUDUSD=X": "AUD_USD",
+    "USDCHF=X": "USD_CHF",
+    "USDCAD=X": "USD_CAD",
+    "GC=F":     "XAU_USD"
 }
 
 # ────────────────────────────────────────────────
@@ -76,17 +83,16 @@ if "oanda_api" not in st.session_state:
             access_token=st.secrets["OANDA"]["access_token"],
             environment=st.secrets["OANDA"]["environment"]
         )
-        log.info("OANDA API initialized successfully")
+        log.info("OANDA API client initialized")
     except Exception as e:
-        st.warning(f"OANDA init failed (will fallback to yfinance): {e}")
+        st.warning(f"OANDA initialization failed (using yfinance fallback): {e}")
         st.session_state.oanda_api = None
 
 def get_config() -> Config:
     return Config.from_dict(st.session_state.config)
 
 def update_config(**kwargs):
-    for k, v in kwargs.items():
-        st.session_state.config[k] = v
+    st.session_state.config.update(kwargs)
 
 # ────────────────────────────────────────────────
 # DATABASE
@@ -131,7 +137,7 @@ def load_signals() -> pd.DataFrame:
         df = df.fillna({'notes':'','outcome':'','confidence':50.0})
         return df
     except Exception as e:
-        log.error(f"Load error: {e}")
+        log.error(f"Load signals error: {e}")
         return pd.DataFrame()
 
 def save_signal(sig: Dict) -> bool:
@@ -152,24 +158,24 @@ def save_signal(sig: Dict) -> bool:
             conn.commit()
         return True
     except Exception as e:
-        log.error(f"Save error: {e}")
+        log.error(f"Save signal error: {e}")
         return False
 
 # ────────────────────────────────────────────────
-# DATA FETCH + INDICATORS (OANDA primary, yfinance fallback)
+# DATA FETCH + INDICATORS
 # ────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
 def fetch_with_indicators(symbol: str, period: str, interval: str):
     instrument = INSTRUMENT_MAP.get(symbol)
     if not instrument:
-        log.warning(f"No OANDA instrument mapped for {symbol}")
+        log.warning(f"No instrument mapping for {symbol}")
         return None
 
     api = st.session_state.oanda_api
     df = None
 
-    # Try OANDA
+    # ─── OANDA attempt ───
     if api:
         try:
             granularity_map = {"1d": "D", "4h": "H4"}
@@ -177,8 +183,8 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
                 raise ValueError(f"Unsupported interval: {interval}")
             granularity = granularity_map[interval]
 
-            count_map = {"1y": 600, "6mo": 2000}
-            count = count_map.get(period.split("mo")[0] + "mo" if "mo" in period else period, 1000)
+            count_map = {"1y": 650, "6mo": 2200}
+            count = count_map.get(period, 1000)
 
             params = {
                 "count": count,
@@ -191,7 +197,8 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
             candles = resp.get("candles", [])
 
             if not candles:
-                raise ValueError("No candles returned from OANDA")
+                log.warning(f"No candles returned from OANDA for {instrument}")
+                raise ValueError("Empty candles response")
 
             rows = []
             for c in candles:
@@ -206,27 +213,29 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
                     })
 
             df = pd.DataFrame(rows).set_index("time")
-            log.info(f"OANDA → {len(df)} candles for {instrument} ({period}, {interval})")
+            log.info(f"OANDA success: {len(df)} candles for {instrument} ({period}, {interval})")
         except Exception as e:
-            log.warning(f"OANDA fetch failed: {e} → falling back to yfinance")
+            log.warning(f"OANDA fetch failed for {instrument}: {e} → fallback to yfinance")
 
-    # Fallback to yfinance
+    # ─── yfinance fallback ───
     if df is None or df.empty:
         try:
-            df = yf.download(symbol, period=period, interval=interval, progress=False)
-            if not df.empty:
-                df = df[['Open','High','Low','Close']].copy()
-                df.columns = ['open','high','low','close']
-                df.index = pd.to_datetime(df.index)
-                log.info(f"yfinance fallback → {len(df)} rows for {symbol}")
+            df = yf.download(symbol, period=period, interval=interval, progress=False, timeout=15)
+            if df.empty:
+                log.warning(f"yfinance returned empty for {symbol}")
+                return None
+            df = df[['Open','High','Low','Close']].copy()
+            df.columns = ['open','high','low','close']
+            df.index = pd.to_datetime(df.index)
+            log.info(f"yfinance fallback: {len(df)} rows for {symbol}")
         except Exception as e:
-            log.error(f"yfinance failed: {e}")
+            log.error(f"yfinance fallback failed for {symbol}: {e}")
             return None
 
-    if df is None or df.empty:
+    if df.empty:
         return None
 
-    # Indicators
+    # ─── Indicators ───
     for span, name in [(9,'ema_fast'), (21,'ema_slow'), (50,'ema_tf'), (200,'ema_ts')]:
         df[name] = df['close'].ewm(span=span, adjust=False).mean()
 
@@ -258,6 +267,7 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
 
     df = df.dropna()
     if df.empty:
+        log.warning(f"Empty after dropna for {symbol}")
         return None
 
     return df
@@ -348,7 +358,7 @@ def find_signal(symbol: str, htf: pd.DataFrame, ltf: pd.DataFrame, seen: Set[str
         tp = entry - (sl - entry) * config.TARGET_RR
         direction = "SHORT"
 
-    units = 1000  # placeholder - consider implementing real sizing
+    units = 1000  # placeholder
 
     confidence = min(
         sig['adx'] +
@@ -429,7 +439,6 @@ def run_historical_scan(lookback_days: int, show_near_misses: bool) -> list:
 
             age_days = (now - sig_time).total_seconds() / 86400
 
-            # Strict signal attempt
             strict_sig = find_signal(symbol, htf, ltf, seen | existing_ids, cfg)
 
             if strict_sig:
@@ -525,8 +534,6 @@ def run_scan():
 st.set_page_config(page_title="Trend Scanner", layout="wide")
 st.title("📈 Trend Following Scanner")
 
-# ─── SIDEBAR ─────────────────────────────────────
-
 with st.sidebar:
     st.header("Controls")
 
@@ -553,24 +560,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Signal Filters")
 
-    aggressive = st.checkbox(
-        "Aggressive Mode (more signals)",
-        value=get_config().AGGRESSIVE_MODE
-    )
+    aggressive = st.checkbox("Aggressive Mode (more signals)", value=get_config().AGGRESSIVE_MODE)
     update_config(AGGRESSIVE_MODE=aggressive)
 
-    enable_di = st.checkbox(
-        "Require DI Direction",
-        value=get_config().ENABLE_DI_CONFIRM
-    )
-    enable_rsi = st.checkbox(
-        "Skip Extreme RSI",
-        value=get_config().ENABLE_RSI_FILTER
-    )
-    enable_pullback = st.checkbox(
-        "Require Pullback to EMA",
-        value=get_config().ENABLE_PULLBACK_FILTER
-    )
+    enable_di = st.checkbox("Require DI Direction", value=get_config().ENABLE_DI_CONFIRM)
+    enable_rsi = st.checkbox("Skip Extreme RSI", value=get_config().ENABLE_RSI_FILTER)
+    enable_pullback = st.checkbox("Require Pullback to EMA", value=get_config().ENABLE_PULLBACK_FILTER)
 
     update_config(
         ENABLE_DI_CONFIRM=enable_di,
@@ -603,7 +598,9 @@ with st.sidebar:
         time.sleep(60)
         st.rerun()
 
-# ─── MAIN AREA ───────────────────────────────────
+# ────────────────────────────────────────────────
+# MAIN CONTENT
+# ────────────────────────────────────────────────
 
 st.header("Saved Signals")
 

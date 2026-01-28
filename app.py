@@ -1434,16 +1434,28 @@ def format_dataframe_decimals(df: pd.DataFrame, decimal_places: int = 2) -> pd.D
     return df
 
 
+# Columns that should have 5 decimal places (price-related)
+PRICE_COLUMNS = {'entry', 'sl', 'tp', 'current_price', 'close_price', 'exit_price'}
+
+# Columns that should have 1 decimal place (pips, percentages, scores)  
+ONE_DECIMAL_COLUMNS = {'pnl_pips', 'mae_pips', 'mfe_pips', 'pips_to_sl', 'pips_to_tp', 
+                       'confidence', 'adx', 'rsi', 'win_prob', 'win_rate', 'pct_to_sl', 'pct_to_tp'}
+
+
 def style_dataframe(df: pd.DataFrame, direction_col: str = "direction", 
                     outcome_col: str = "outcome") -> pd.io.formats.style.Styler:
     """
-    Apply standard styling to dataframe: round to 2 decimals, color direction/outcome.
+    Apply standard styling to dataframe:
+    - Price columns (entry, sl, tp, current_price): 5 decimal places
+    - Pip/score columns: 1 decimal place
+    - Other numeric: 2 decimal places
+    - Color direction (green LONG / red SHORT)
+    - Color outcome (green win / red loss)
     """
     if df.empty:
         return df.style
     
-    # Round numeric columns to 2 decimals
-    df = format_dataframe_decimals(df, 2)
+    df = df.copy()
     
     # Apply styling
     styler = df.style
@@ -1451,14 +1463,19 @@ def style_dataframe(df: pd.DataFrame, direction_col: str = "direction",
     if direction_col in df.columns:
         styler = styler.applymap(style_direction, subset=[direction_col])
     
-    if outcome_col in df.columns:
+    if outcome_col in df.columns and outcome_col in df.columns:
         styler = styler.applymap(style_outcome, subset=[outcome_col])
     
-    # Format numeric columns to show 2 decimal places in display
+    # Build format dictionary with appropriate decimal places per column
     format_dict = {}
     for col in df.columns:
         if df[col].dtype in ['float64', 'float32', 'float']:
-            format_dict[col] = '{:.2f}'
+            if col in PRICE_COLUMNS:
+                format_dict[col] = '{:.5f}'
+            elif col in ONE_DECIMAL_COLUMNS:
+                format_dict[col] = '{:.1f}'
+            else:
+                format_dict[col] = '{:.2f}'
     
     if format_dict:
         styler = styler.format(format_dict)
@@ -1768,10 +1785,14 @@ with tab3:
                 df = add_market_context(df)
         
         cols = ["instrument", "direction", "entry", "sl", "tp", "units",
-               "confidence", "adx", "atr_ratio", "rsi", "status", "outcome",
+               "confidence", "adx", "atr_ratio", "rsi", "win_prob", "status", "outcome",
                "pnl_pips", "mae_pips", "mfe_pips", "open_time"]
         if "current_price" in df.columns:
             cols.insert(5, "current_price")
+        if "pips_to_sl" in df.columns:
+            cols.insert(cols.index("pnl_pips"), "pips_to_sl")
+        if "pips_to_tp" in df.columns:
+            cols.insert(cols.index("pnl_pips"), "pips_to_tp")
         cols = [c for c in cols if c in df.columns]
         
         styled = style_dataframe(df[cols], direction_col="direction", outcome_col="outcome")

@@ -1,5 +1,6 @@
 # app.py — Trading Scanner Dashboard with Streamlit + SQLite + OANDA + Email
 # Enhanced: pullbacks, HTF momentum, configurable filters, safety checks
+# Added: historical scan + near-miss visibility to see yesterday's opportunities
 
 import streamlit as st
 import pandas as pd
@@ -40,8 +41,8 @@ class Config:
     MIN_HTF_ATR_PCT: float = 0.8
     ENABLE_DI_CONFIRM: bool = True
     ENABLE_RSI_FILTER: bool = True
-    ENABLE_PULLBACK_FILTER: bool = True      # new
-    PULLBACK_ATR_MAX: float = 1.2           # how close to EMA for pullback
+    ENABLE_PULLBACK_FILTER: bool = True
+    PULLBACK_ATR_MAX: float = 1.2
     AGGRESSIVE_MODE: bool = False
 
     def to_dict(self):
@@ -63,20 +64,6 @@ INSTRUMENT_MAP = {
     "EURUSD=X": "EUR_USD", "USDJPY=X": "USD_JPY", "GBPUSD=X": "GBP_USD",
     "AUDUSD=X": "AUD_USD", "USDCHF=X": "USD_CHF", "USDCAD=X": "USD_CAD",
     "GC=F": "XAU_USD"
-}
-
-PIP_SIZES = {
-    "EUR_USD": 0.0001, "GBP_USD": 0.0001, "AUD_USD": 0.0001,
-    "USD_CHF": 0.0001, "USD_CAD": 0.0001, "USD_JPY": 0.01,
-    "XAU_USD": 0.1
-}
-
-PIP_VALUE_PER_LOT = {
-    "EUR_USD": 10.0, "GBP_USD": 10.0, "AUD_USD": 10.0,
-    "USD_JPY": lambda p: 1000.0 / p,
-    "USD_CHF": lambda p: 10.0 / p,
-    "USD_CAD": lambda p: 10.0 / p,
-    "XAU_USD": 1.0,
 }
 
 # ────────────────────────────────────────────────
@@ -288,7 +275,7 @@ def find_signal(symbol: str, htf: pd.DataFrame, ltf: pd.DataFrame, seen: Set[str
     if config.ENABLE_PULLBACK_FILTER:
         dist_to_ema = abs(sig['close'] - sig['ema_fast']) / sig['atr']
         if dist_to_ema > config.PULLBACK_ATR_MAX:
-            return None  # too far from EMA → no pullback
+            return None
 
     # Safety: avoid extreme overextension
     if abs(sig['close'] - sig['ema_slow']) / sig['atr'] > 2.0:
@@ -341,7 +328,109 @@ def find_signal(symbol: str, htf: pd.DataFrame, ltf: pd.DataFrame, seen: Set[str
     }
 
 # ────────────────────────────────────────────────
-# SCAN
+# HISTORICAL + NEAR-MISS SCAN (to see yesterday's opportunities)
+# ────────────────────────────────────────────────
+
+def run_historical_scan(lookback_days: int, show_near_misses: bool) -> list:
+    cfg = get_config()
+    all_opps = []
+    seen = set()
+
+    # Load existing (real) signals to avoid duplicates
+    df_existing = load_signals()
+    existing_ids = set(df_existing['id']) if not df_existing.empty else set()
+
+    for symbol in PAIRS:
+        htf = fetch_with_indicators(symbol, "1y", "1d")
+        ltf = fetch_with_indicators(symbol, "6mo", "4h")
+        if htf is None or ltf is None:
+            continue
+
+        now = ltf.index[-1]
+        ltf_recent = ltf[ltf.index >= now - pd.Timedelta(days=lookback_days + 1)]
+
+        if ltf_recent.empty:
+            continue
+
+        ltf_recent = ltf_recent.copy()
+        ltf_recent['bull_cross'] = (ltf_recent['ema_fast'] > ltf_recent['ema_slow']) & \
+                                   (ltf_recent['ema_fast'].shift(1) <= ltf_recent['ema_slow'].shift(1))
+        ltf_recent['bear_cross'] = (ltf_recent['ema_fast'] < ltf_recent['ema_slow']) & \
+                                   (ltf_recent['ema_fast'].shift(1) >= ltf_recent['ema_slow'].shift(1))
+
+        crosses = ltf_recent[ltf_recent['bull_cross'] | ltf_recent['bear_cross']]
+
+        for idx, row in crosses.iterrows():
+            trend = "UP" if row['bull_cross'] else "DOWN"
+            sig_time = idx
+
+            pos = ltf.index.get_loc(idx)
+            if pos + 1 >= len(ltf):
+                continue
+            entry = float(ltf.iloc[pos + 1]['open'])
+
+            age_days = (now - sig_time).total_seconds() / 86400
+
+            # Try to get full strict signal (reuse original logic)
+            strict_sig = find_signal(symbol, htf, ltf, seen | existing_ids, cfg)
+
+            if strict_sig:
+                status = "New Signal" if strict_sig['id'] not in existing_ids else "Existing"
+                all_opps.append({
+                    **strict_sig,
+                    "status": status,
+                    "age_days": round(age_days, 1),
+                    "cross_time": sig_time.strftime('%Y-%m-%d %H:%M')
+                })
+                continue
+
+            # Near-miss if enabled
+            if not show_near_misses:
+                continue
+
+            if age_days > cfg.MAX_SIGNAL_AGE_DAYS * 2:
+                continue
+
+            last_htf = htf.iloc[-1]
+            if trend == "UP" and not (last_htf['close'] > last_htf['ema_tf'] > last_htf['ema_ts']):
+                continue
+            if trend == "DOWN" and not (last_htf['close'] < last_htf['ema_tf'] < last_htf['ema_ts']):
+                continue
+
+            atr = row['atr']
+            instrument = INSTRUMENT_MAP[symbol]
+            sl_mult = 1.2 if instrument == "XAU_USD" else cfg.ATR_SL_MULT
+
+            if trend == "UP":
+                sl = entry - atr * sl_mult
+                tp = entry + (entry - sl) * cfg.TARGET_RR
+                direction = "LONG"
+            else:
+                sl = entry + atr * sl_mult
+                tp = entry - (sl - entry) * cfg.TARGET_RR
+                direction = "SHORT"
+
+            sid = f"{symbol}_{sig_time.strftime('%Y%m%d_%H%M')}_{direction}_near"
+
+            all_opps.append({
+                "id": sid,
+                "symbol_raw": symbol,
+                "direction": direction,
+                "entry": entry,
+                "sl": float(sl),
+                "tp": float(tp),
+                "open_time": datetime.now(timezone.utc).isoformat(),
+                "confidence": 30.0,
+                "status": "Near-miss (relaxed filters)",
+                "age_days": round(age_days, 1),
+                "cross_time": sig_time.strftime('%Y-%m-%d %H:%M'),
+                "failed_filters": "Strict ADX/ATR/DI/RSI/Pullback not met"
+            })
+
+    return sorted(all_opps, key=lambda x: x.get('age_days', 999))
+
+# ────────────────────────────────────────────────
+# LIVE SCAN (only strict new signals)
 # ────────────────────────────────────────────────
 
 def run_scan():
@@ -359,6 +448,7 @@ def run_scan():
         sig = find_signal(symbol, htf, ltf, seen, cfg)
         if sig and save_signal(sig):
             new_signals.append(sig)
+            seen.add(sig["id"])
 
     return new_signals
 
@@ -386,7 +476,7 @@ with st.sidebar:
         st.caption(f"Last scan: {st.session_state.last_scan.strftime('%H:%M:%S')} ({age.seconds//60} min ago)")
 
     st.divider()
-    st.subheader("Signal Filters (Testing)")
+    st.subheader("Signal Filters")
 
     aggressive = st.checkbox("Aggressive Mode (more signals)", value=get_config().AGGRESSIVE_MODE)
     update_config(AGGRESSIVE_MODE=aggressive)
@@ -396,9 +486,9 @@ with st.sidebar:
     st.checkbox("Require Pullback to EMA", value=get_config().ENABLE_PULLBACK_FILTER, key="pullback")
 
     update_config(
-        ENABLE_DI_CONFIRM=st.session_state.di,
-        ENABLE_RSI_FILTER=st.session_state.rsi,
-        ENABLE_PULLBACK_FILTER=st.session_state.pullback
+        ENABLE_DI_CONFIRM=st.session_state.get("di", True),
+        ENABLE_RSI_FILTER=st.session_state.get("rsi", True),
+        ENABLE_PULLBACK_FILTER=st.session_state.get("pullback", True)
     )
 
     if st.button("Reset Filters"):
@@ -406,14 +496,34 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    st.subheader("Historical / Debug Scan")
+
+    lookback_days = st.slider("Lookback days for opportunities", 1, 14, 3)
+    show_near_misses = st.checkbox("Show near-miss opportunities", value=True)
+
+    if st.button("Scan Recent + Historical", type="secondary", use_container_width=True):
+        with st.spinner(f"Scanning last {lookback_days} days..."):
+            historical = run_historical_scan(lookback_days, show_near_misses)
+            if historical:
+                st.success(f"Found {len(historical)} opportunities / near-misses")
+                st.dataframe(pd.DataFrame(historical))
+            else:
+                st.info("No crossovers or opportunities found in the lookback period.")
+
+    st.divider()
     st.subheader("Auto-refresh")
     if st.checkbox("Auto-refresh every 60s"):
         time.sleep(60)
         st.rerun()
 
-# Main content
+# ────────────────────────────────────────────────
+# MAIN CONTENT
+# ────────────────────────────────────────────────
+
+st.header("Saved Signals")
+
 df = load_signals()
 if df.empty:
-    st.info("No signals yet. Click 'Run Scan Now' to start.")
+    st.info("No confirmed signals yet. Try 'Run Scan Now' or check historical opportunities.")
 else:
     st.dataframe(df, use_container_width=True)

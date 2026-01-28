@@ -1501,13 +1501,13 @@ with tab2:
         st.divider()
         c_a, c_b, c_c, c_d = st.columns(4)
         with c_a:
-            st.metric("Avg MAE", f"{stats['avg_mae']} pips", help="Max Adverse Excursion")
+            st.metric("Avg MAE", f"{stats.get('avg_mae', 0)} pips", help="Max Adverse Excursion")
         with c_b:
-            st.metric("Avg MFE", f"{stats['avg_mfe']} pips", help="Max Favorable Excursion")
+            st.metric("Avg MFE", f"{stats.get('avg_mfe', 0)} pips", help="Max Favorable Excursion")
         with c_c:
-            st.metric("Gross Profit", f"{stats['gross_profit']} pips")
+            st.metric("Gross Profit", f"{stats.get('gross_profit', 0)} pips")
         with c_d:
-            st.metric("Gross Loss", f"-{stats['gross_loss']} pips")
+            st.metric("Gross Loss", f"-{stats.get('gross_loss', 0)} pips")
         
         st.divider()
         

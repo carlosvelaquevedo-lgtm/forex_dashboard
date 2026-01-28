@@ -1418,6 +1418,54 @@ def build_rejection_heatmap(rejections: Dict) -> pd.DataFrame:
     return df
 
 
+def format_dataframe_decimals(df: pd.DataFrame, decimal_places: int = 2) -> pd.DataFrame:
+    """
+    Format all numeric columns in a dataframe to specified decimal places.
+    """
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    
+    for col in df.columns:
+        if df[col].dtype in ['float64', 'float32', 'float']:
+            df[col] = df[col].round(decimal_places)
+    
+    return df
+
+
+def style_dataframe(df: pd.DataFrame, direction_col: str = "direction", 
+                    outcome_col: str = "outcome") -> pd.io.formats.style.Styler:
+    """
+    Apply standard styling to dataframe: round to 2 decimals, color direction/outcome.
+    """
+    if df.empty:
+        return df.style
+    
+    # Round numeric columns to 2 decimals
+    df = format_dataframe_decimals(df, 2)
+    
+    # Apply styling
+    styler = df.style
+    
+    if direction_col in df.columns:
+        styler = styler.applymap(style_direction, subset=[direction_col])
+    
+    if outcome_col in df.columns:
+        styler = styler.applymap(style_outcome, subset=[outcome_col])
+    
+    # Format numeric columns to show 2 decimal places in display
+    format_dict = {}
+    for col in df.columns:
+        if df[col].dtype in ['float64', 'float32', 'float']:
+            format_dict[col] = '{:.2f}'
+    
+    if format_dict:
+        styler = styler.format(format_dict)
+    
+    return styler
+
+
 # ────────────────────────────────────────────────
 # STYLING HELPERS
 # ────────────────────────────────────────────────
@@ -1587,7 +1635,7 @@ with tab1:
                         "confidence", "adx", "atr_ratio", "rsi", "win_prob"]
         display_cols = [c for c in display_cols if c in scan_df.columns]
         
-        styled = scan_df[display_cols].style.applymap(style_direction, subset=["direction"])
+        styled = style_dataframe(scan_df[display_cols], direction_col="direction", outcome_col="")
         st.dataframe(styled, use_container_width=True)
         
         if st.checkbox("Show Market Context", value=True):
@@ -1597,7 +1645,8 @@ with tab1:
                            "pips_to_sl", "pips_to_tp", "status_emoji"]
                 ctx_cols = [c for c in ctx_cols if c in context_df.columns]
                 st.subheader("📍 Market Context")
-                st.dataframe(context_df[ctx_cols], use_container_width=True)
+                styled_ctx = style_dataframe(context_df[ctx_cols], direction_col="direction", outcome_col="")
+                st.dataframe(styled_ctx, use_container_width=True)
     else:
         st.info("Run a scan to see results")
 
@@ -1648,9 +1697,7 @@ with tab2:
                        "pnl_pips", "mae_pips", "mfe_pips", "hold_bars", "win_prob"]
                 cols = [c for c in cols if c in sig_df.columns]
                 
-                styled = sig_df[cols].style.applymap(
-                    style_direction, subset=["direction"]
-                ).applymap(style_outcome, subset=["outcome"] if "outcome" in cols else [])
+                styled = style_dataframe(sig_df[cols], direction_col="direction", outcome_col="outcome")
                 st.dataframe(styled, use_container_width=True)
         else:
             # No signals found - show filter rejection analysis
@@ -1727,9 +1774,7 @@ with tab3:
             cols.insert(5, "current_price")
         cols = [c for c in cols if c in df.columns]
         
-        styled = df[cols].style.applymap(style_direction, subset=["direction"])
-        if "outcome" in cols:
-            styled = styled.applymap(style_outcome, subset=["outcome"])
+        styled = style_dataframe(df[cols], direction_col="direction", outcome_col="outcome")
         st.dataframe(styled, use_container_width=True)
         st.caption(f"Total: {len(df)}")
 
@@ -1761,7 +1806,8 @@ with tab4:
             show_cols = ["run_time", "lookback_days", "total_signals", 
                         "win_rate", "total_pips", "profit_factor", "avg_mae", "avg_mfe"]
             show_cols = [c for c in show_cols if c in bt_hist.columns]
-            st.dataframe(bt_hist[show_cols], use_container_width=True)
+            formatted_hist = format_dataframe_decimals(bt_hist[show_cols], 2)
+            st.dataframe(formatted_hist, use_container_width=True)
         else:
             st.info("No history")
     

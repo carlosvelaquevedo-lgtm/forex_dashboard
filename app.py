@@ -1,6 +1,6 @@
-# app.py — Trading Scanner Dashboard with Streamlit + SQLite + OANDA + Email
+# app.py — Trading Scanner Dashboard with Streamlit + SQLite + yfinance
 # Enhanced: pullbacks, HTF momentum, configurable filters, safety checks
-# Added: historical scan + near-miss visibility to see yesterday's opportunities
+# Added: historical scan + near-miss visibility + defensive empty dataframe handling
 
 import streamlit as st
 import pandas as pd
@@ -11,16 +11,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Dict, Set, Optional
 import logging
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from contextlib import contextmanager
 import time
-
-try:
-    from tpqoa import tpqoa
-except ImportError:
-    tpqoa = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -74,8 +65,6 @@ if "config" not in st.session_state:
     st.session_state.config = Config().to_dict()
 if "last_scan" not in st.session_state:
     st.session_state.last_scan = None
-if "oanda_error" not in st.session_state:
-    st.session_state.oanda_error = None
 
 def get_config() -> Config:
     return Config.from_dict(st.session_state.config)
@@ -151,7 +140,7 @@ def save_signal(sig: Dict) -> bool:
         return False
 
 # ────────────────────────────────────────────────
-# DATA FETCH + INDICATORS
+# DATA FETCH + INDICATORS (with better empty handling)
 # ────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
@@ -159,6 +148,7 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
     try:
         df = yf.download(symbol, period=period, interval=interval, progress=False)
         if df.empty:
+            log.warning(f"yfinance returned empty DataFrame for {symbol} ({period}, {interval})")
             return None
 
         df = df[['Open','High','Low','Close']].copy()
@@ -197,9 +187,15 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
         rs = gain / loss.replace(0, np.nan)
         df['rsi'] = 100 - (100 / (1 + rs))
 
-        return df.dropna()
+        df = df.dropna()
+        if df.empty:
+            log.warning(f"No valid rows left after dropna for {symbol} ({period}, {interval})")
+            return None
+
+        return df
+
     except Exception as e:
-        log.error(f"Fetch+indicators error {symbol}: {e}")
+        log.error(f"Fetch+indicators failed for {symbol}: {str(e)}")
         return None
 
 # ────────────────────────────────────────────────
@@ -227,12 +223,10 @@ def find_signal(symbol: str, htf: pd.DataFrame, ltf: pd.DataFrame, seen: Set[str
     if trend == "DOWN" and last_htf['ema_fast'] > last_htf['ema_slow']:
         return None
 
-    # Aggressive scaling
     min_adx = config.MIN_ADX * (0.65 if config.AGGRESSIVE_MODE else 1.0)
     min_atr_pct = config.MIN_ATR_RATIO_PCT * (0.6 if config.AGGRESSIVE_MODE else 1.0)
     max_age = config.MAX_SIGNAL_AGE_DAYS * (2.5 if config.AGGRESSIVE_MODE else 1.0)
 
-    # Find crossover
     ltf = ltf.copy()
     ltf['bull_cross'] = (ltf['ema_fast'] > ltf['ema_slow']) & (ltf['ema_fast'].shift(1) <= ltf['ema_slow'].shift(1))
     ltf['bear_cross'] = (ltf['ema_fast'] < ltf['ema_slow']) & (ltf['ema_fast'].shift(1) >= ltf['ema_slow'].shift(1))
@@ -242,49 +236,42 @@ def find_signal(symbol: str, htf: pd.DataFrame, ltf: pd.DataFrame, seen: Set[str
     if crosses.empty:
         return None
 
-    # Take most recent
     sig_idx = crosses.index[-1]
     sig = ltf.loc[sig_idx]
 
-    # Age check
     age_days = (ltf.index[-1] - sig_idx).total_seconds() / 86400
     if age_days > max_age:
         return None
 
-    # Core filters
     if sig['adx'] < min_adx:
         return None
     if (sig['atr'] / sig['close']) * 100 < min_atr_pct:
         return None
 
-    # DI confirmation
     if config.ENABLE_DI_CONFIRM:
         if trend == "UP" and sig['plus_di'] <= sig['minus_di']:
             return None
         if trend == "DOWN" and sig['minus_di'] <= sig['plus_di']:
             return None
 
-    # RSI filter
     if config.ENABLE_RSI_FILTER:
         if trend == "UP" and sig['rsi'] > 70:
             return None
         if trend == "DOWN" and sig['rsi'] < 30:
             return None
 
-    # Pullback filter (optional)
     if config.ENABLE_PULLBACK_FILTER:
         dist_to_ema = abs(sig['close'] - sig['ema_fast']) / sig['atr']
         if dist_to_ema > config.PULLBACK_ATR_MAX:
             return None
 
-    # Safety: avoid extreme overextension
     if abs(sig['close'] - sig['ema_slow']) / sig['atr'] > 2.0:
         return None
 
-    # Entry = next candle open
-    if len(ltf) <= ltf.index.get_loc(sig_idx) + 1:
+    pos = ltf.index.get_loc(sig_idx)
+    if pos + 1 >= len(ltf):
         return None
-    entry = float(ltf.iloc[ltf.index.get_loc(sig_idx) + 1]['open'])
+    entry = float(ltf.iloc[pos + 1]['open'])
 
     atr = sig['atr']
     instrument = INSTRUMENT_MAP[symbol]
@@ -299,10 +286,10 @@ def find_signal(symbol: str, htf: pd.DataFrame, ltf: pd.DataFrame, seen: Set[str
         tp = entry - (sl - entry) * config.TARGET_RR
         direction = "SHORT"
 
-    units = 1000  # placeholder – replace with your position_size function
+    units = 1000  # placeholder
 
     confidence = min(
-        sig['adx'] + 
+        sig['adx'] +
         (sig['plus_di'] - sig['minus_di'] if trend == "UP" else sig['minus_di'] - sig['plus_di']) * 0.5 +
         (10 if 40 < sig['rsi'] < 60 else 0) -
         (10 if sig['adx'] > 45 else 0),
@@ -328,7 +315,7 @@ def find_signal(symbol: str, htf: pd.DataFrame, ltf: pd.DataFrame, seen: Set[str
     }
 
 # ────────────────────────────────────────────────
-# HISTORICAL + NEAR-MISS SCAN (to see yesterday's opportunities)
+# HISTORICAL + NEAR-MISS SCAN
 # ────────────────────────────────────────────────
 
 def run_historical_scan(lookback_days: int, show_near_misses: bool) -> list:
@@ -336,20 +323,29 @@ def run_historical_scan(lookback_days: int, show_near_misses: bool) -> list:
     all_opps = []
     seen = set()
 
-    # Load existing (real) signals to avoid duplicates
     df_existing = load_signals()
     existing_ids = set(df_existing['id']) if not df_existing.empty else set()
+
+    skipped = []
 
     for symbol in PAIRS:
         htf = fetch_with_indicators(symbol, "1y", "1d")
         ltf = fetch_with_indicators(symbol, "6mo", "4h")
+
         if htf is None or ltf is None:
+            skipped.append(symbol)
+            continue
+
+        if len(ltf) < 10:
+            log.info(f"Skipping {symbol} — LTF has only {len(ltf)} rows")
+            skipped.append(symbol)
             continue
 
         now = ltf.index[-1]
         ltf_recent = ltf[ltf.index >= now - pd.Timedelta(days=lookback_days + 1)]
 
         if ltf_recent.empty:
+            skipped.append(symbol)
             continue
 
         ltf_recent = ltf_recent.copy()
@@ -371,7 +367,7 @@ def run_historical_scan(lookback_days: int, show_near_misses: bool) -> list:
 
             age_days = (now - sig_time).total_seconds() / 86400
 
-            # Try to get full strict signal (reuse original logic)
+            # Try strict signal
             strict_sig = find_signal(symbol, htf, ltf, seen | existing_ids, cfg)
 
             if strict_sig:
@@ -384,7 +380,6 @@ def run_historical_scan(lookback_days: int, show_near_misses: bool) -> list:
                 })
                 continue
 
-            # Near-miss if enabled
             if not show_near_misses:
                 continue
 
@@ -427,10 +422,13 @@ def run_historical_scan(lookback_days: int, show_near_misses: bool) -> list:
                 "failed_filters": "Strict ADX/ATR/DI/RSI/Pullback not met"
             })
 
+    if skipped:
+        st.caption(f"Skipped due to missing/insufficient data: {', '.join(skipped)}")
+
     return sorted(all_opps, key=lambda x: x.get('age_days', 999))
 
 # ────────────────────────────────────────────────
-# LIVE SCAN (only strict new signals)
+# LIVE SCAN
 # ────────────────────────────────────────────────
 
 def run_scan():
@@ -438,17 +436,23 @@ def run_scan():
     df = load_signals()
     seen = set(df['id']) if not df.empty else set()
     new_signals = []
+    skipped = []
 
     for symbol in PAIRS:
         htf = fetch_with_indicators(symbol, "1y", "1d")
         ltf = fetch_with_indicators(symbol, "6mo", "4h")
-        if htf is None or ltf is None:
+
+        if htf is None or ltf is None or len(ltf) < 10 or len(htf) < 100:
+            skipped.append(symbol)
             continue
 
         sig = find_signal(symbol, htf, ltf, seen, cfg)
         if sig and save_signal(sig):
             new_signals.append(sig)
             seen.add(sig["id"])
+
+    if skipped:
+        st.caption(f"Skipped in live scan due to data issues: {', '.join(skipped)}")
 
     return new_signals
 

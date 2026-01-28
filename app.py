@@ -67,7 +67,8 @@ PAIRS = [
     "EURUSD=X", "USDJPY=X", "GBPUSD=X",
     "AUDUSD=X", "USDCHF=X", "USDCAD=X",
     "GC=F"
-]INSTRUMENT_MAP = {
+]
+    INSTRUMENT_MAP = {
     "EURUSD=X": "EUR_USD",
     "USDJPY=X": "USD_JPY",
     "GBPUSD=X": "GBP_USD",
@@ -75,7 +76,8 @@ PAIRS = [
     "USDCHF=X": "USD_CHF",
     "USDCAD=X": "USD_CAD",
     "GC=F": "XAU_USD"
-}REVERSE_INSTRUMENT_MAP = {v: k for k, v in INSTRUMENT_MAP.items()}# Pip multipliers and values for position sizing
+}
+REVERSE_INSTRUMENT_MAP = {v: k for k, v in INSTRUMENT_MAP.items()}# Pip multipliers and values for position sizing
 INSTRUMENT_SPECS = {
     "EURUSD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5},
     "USDJPY=X": {"pip_multiplier": 100, "pip_value_per_lot": 1000 / 150, "type": "forex", "decimals": 3},

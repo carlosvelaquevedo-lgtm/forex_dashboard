@@ -68,7 +68,7 @@ PAIRS = [
     "AUDUSD=X", "USDCHF=X", "USDCAD=X",
     "GC=F"
 ]
-    INSTRUMENT_MAP = {
+INSTRUMENT_MAP = {
     "EURUSD=X": "EUR_USD",
     "USDJPY=X": "USD_JPY",
     "GBPUSD=X": "GBP_USD",

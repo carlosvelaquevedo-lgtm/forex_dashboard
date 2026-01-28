@@ -21,6 +21,19 @@ import oandapyV20
 from oandapyV20 import API
 from oandapyV20.endpoints.instruments import InstrumentsCandles
 
+PAIRS = [
+    "EURUSD=X",
+    "USDJPY=X",
+    "GBPUSD=X",
+    "AUDUSD=X",
+    "USDCHF=X",
+    "USDCAD=X",
+    "GC=F"
+]
+assert isinstance(PAIRS, list) and len(PAIRS) > 0, "PAIRS is not defined correctly"
+st.write("Pairs loaded:", PAIRS)
+
+
 # ────────────────────────────────────────────────
 # LOGGING
 # ────────────────────────────────────────────────
@@ -212,7 +225,7 @@ def fetch_with_indicators(symbol: str, period: str, interval: str):
 def run_scan():
     results = []
 
-    for pair in Config.PAIRS:
+    for pair in PAIRS:
         try:
             htf = fetch_data(pair, Config.HTF)
             ltf = fetch_data(pair, Config.LTF)
@@ -261,7 +274,7 @@ def run_historical_scan(lookback_days: int):
     signals = []
     rejections = {}
 
-    for pair in Config.PAIRS:
+    for pair in PAIRS:
         rejections[pair] = {}
 
         try:

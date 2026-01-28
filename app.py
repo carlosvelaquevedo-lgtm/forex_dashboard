@@ -1543,14 +1543,13 @@ with st.sidebar:
         di_confirm = st.checkbox("DI Confirmation", cfg.ENABLE_DI_CONFIRM)
         rsi_filter = st.checkbox("RSI Filter", cfg.ENABLE_RSI_FILTER)
         pullback_filter = st.checkbox("Pullback Filter", cfg.ENABLE_PULLBACK_FILTER)
-        parallel_scan = st.checkbox("Parallel Scan", cfg.ENABLE_PARALLEL_SCAN)
 
         if st.button("Update Scan Settings"):
             update_config(
                 MIN_ADX=min_adx, MIN_ATR_RATIO_PCT=min_atr, ATR_SL_MULT=atr_sl,
                 TARGET_RR=target_rr, HIST_SCAN_STEP=hist_step,
                 ENABLE_DI_CONFIRM=di_confirm, ENABLE_RSI_FILTER=rsi_filter,
-                ENABLE_PULLBACK_FILTER=pullback_filter, ENABLE_PARALLEL_SCAN=parallel_scan,
+                ENABLE_PULLBACK_FILTER=pullback_filter,
             )
             st.success("Updated!")
 

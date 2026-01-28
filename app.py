@@ -23,7 +23,6 @@ import logging
 import time
 import random
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import oandapyV20
 from oandapyV20 import API
@@ -65,9 +64,6 @@ class Config:
     SPREAD_PIPS: float = 1.5  # Typical spread in pips
     SLIPPAGE_PIPS: float = 0.5  # Typical slippage in pips
     MAX_HOLD_DAYS: int = 30  # Max days to hold a trade in backtest
-    # v4: Parallel scanning
-    ENABLE_PARALLEL_SCAN: bool = False  # Disabled: st.session_state not accessible in threads
-    MAX_WORKERS: int = 4
 
     def to_dict(self):
         return self.__dict__
@@ -492,11 +488,6 @@ def test_oanda_connection() -> Dict:
         results["error"] = str(e)
     
     return results
-
-
-def fetch_data_for_pair(pair: str, htf: str, ltf: str) -> Tuple[str, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Helper for parallel fetching."""
-    return pair, fetch_data(pair, htf), fetch_data(pair, ltf)
 
 
 def get_current_price(symbol: str) -> Optional[float]:
@@ -1164,48 +1155,25 @@ def estimate_win_probability(signal: Dict, historical_stats: Dict = None) -> flo
 
 
 # ────────────────────────────────────────────────
-# LIVE SCAN (v4: Parallel)
+# LIVE SCAN
 # ────────────────────────────────────────────────
 
 def run_scan() -> Tuple[List[Dict], float]:
-    """Run live scan with optional parallel fetching."""
+    """Run live scan - sequential fetching."""
     cfg = get_config()
     results = []
     start_time = time.time()
     
-    if cfg.ENABLE_PARALLEL_SCAN:
-        # Parallel data fetching
-        pair_data = {}
-        with ThreadPoolExecutor(max_workers=cfg.MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(fetch_data_for_pair, pair, cfg.HTF, cfg.LTF): pair 
-                for pair in PAIRS
-            }
-            for future in as_completed(futures):
-                try:
-                    pair, htf, ltf = future.result()
-                    pair_data[pair] = (htf, ltf)
-                except Exception as e:
-                    logger.warning(f"Parallel fetch failed: {e}")
-        
-        # Process results
-        for pair, (htf, ltf) in pair_data.items():
+    for pair in PAIRS:
+        try:
+            htf = fetch_data(pair, cfg.HTF)
+            ltf = fetch_data(pair, cfg.LTF)
             signal = _process_pair_for_signal(pair, htf, ltf, cfg)
             if signal:
                 results.append(signal)
                 save_signal(signal)
-    else:
-        # Sequential scanning
-        for pair in PAIRS:
-            try:
-                htf = fetch_data(pair, cfg.HTF)
-                ltf = fetch_data(pair, cfg.LTF)
-                signal = _process_pair_for_signal(pair, htf, ltf, cfg)
-                if signal:
-                    results.append(signal)
-                    save_signal(signal)
-            except Exception as e:
-                logger.exception(f"{pair}: scan failed → {e}")
+        except Exception as e:
+            logger.exception(f"{pair}: scan failed → {e}")
     
     duration = time.time() - start_time
     return results, duration
@@ -1261,23 +1229,10 @@ def run_historical_scan(lookback_days: int) -> Tuple[List[Dict], Dict, List[str]
         if not is_ok:
             warnings.append(f"⚠️ {warning}")
 
-    # v4: Parallel data fetching
+    # Sequential data fetching (parallel disabled - st.session_state not thread-safe)
     pair_data = {}
-    if cfg.ENABLE_PARALLEL_SCAN:
-        with ThreadPoolExecutor(max_workers=cfg.MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(fetch_data_for_pair, pair, cfg.HTF, cfg.LTF): pair 
-                for pair in PAIRS
-            }
-            for future in as_completed(futures):
-                try:
-                    pair, htf, ltf = future.result()
-                    pair_data[pair] = (htf, ltf)
-                except Exception as e:
-                    logger.warning(f"Parallel fetch error: {e}")
-    else:
-        for pair in PAIRS:
-            pair_data[pair] = (fetch_data(pair, cfg.HTF), fetch_data(pair, cfg.LTF))
+    for pair in PAIRS:
+        pair_data[pair] = (fetch_data(pair, cfg.HTF), fetch_data(pair, cfg.LTF))
 
     for pair in PAIRS:
         rejections[pair] = {}

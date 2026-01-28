@@ -1,15 +1,5 @@
-# app.py — Trend Following Scanner (FULL MERGED VERSION - v4)
+# app.py — Trend Following Scanner v4
 # Streamlit + SQLite + OANDA (primary) / yfinance fallback
-#
-# v4 Features:
-# - Backtest realism: spread + slippage simulation
-# - Max hold days to prevent look-ahead bias
-# - Outcome persistence with "Update Outcomes" button
-# - Improved current price reliability (5m fallback)
-# - Calibrated win probability (capped, realistic)
-# - MAE/MFE tracking for trade analysis
-# - Corrected gold pip convention (0.1 = 1 pip)
-# - Parallel scanning with ThreadPoolExecutor
 
 import streamlit as st
 import pandas as pd
@@ -18,7 +8,7 @@ import sqlite3
 import yfinance as yf
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
-from typing import Dict, Set, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple
 import logging
 import time
 import random
@@ -54,18 +44,13 @@ class Config:
     ENABLE_RSI_FILTER: bool = True
     ENABLE_PULLBACK_FILTER: bool = True
     PULLBACK_ATR_MAX: float = 1.2
-    AGGRESSIVE_MODE: bool = False
-    # Timeframe settings
     HTF: str = "1d"
     LTF: str = "4h"
     MIN_BARS: int = 50
-    # Historical scan optimization
     HIST_SCAN_STEP: int = 6
-    # v4: Backtest realism
-    SPREAD_PIPS: float = 1.5  # Typical spread in pips
-    SLIPPAGE_PIPS: float = 0.5  # Typical slippage in pips
-    MAX_HOLD_DAYS: int = 30  # Max days to hold a trade in backtest
-    # v4: Parallel scanning
+    SPREAD_PIPS: float = 1.5
+    SLIPPAGE_PIPS: float = 0.5
+    MAX_HOLD_DAYS: int = 30
     ENABLE_PARALLEL_SCAN: bool = True
     MAX_WORKERS: int = 4
 
@@ -75,7 +60,6 @@ class Config:
     @classmethod
     def from_dict(cls, d):
         return cls(**{k: v for k, v in d.items() if hasattr(cls, k)})
-
 
 # ────────────────────────────────────────────────
 # PAIRS AND INSTRUMENT MAPPING
@@ -99,28 +83,20 @@ INSTRUMENT_MAP = {
 
 REVERSE_INSTRUMENT_MAP = {v: k for k, v in INSTRUMENT_MAP.items()}
 
-# v4: Corrected pip multipliers
-# Gold: 0.1 move = 1 pip (industry standard), so multiplier = 10
-# JPY pairs: 0.01 move = 1 pip, so multiplier = 100
-# Other forex: 0.0001 move = 1 pip, so multiplier = 10000
 INSTRUMENT_SPECS = {
-    "EURUSD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5, "spread_pips": 1.0},
-    "USDJPY=X": {"pip_multiplier": 100, "pip_value_per_lot": 1000 / 150, "type": "forex", "decimals": 3, "spread_pips": 1.2},
-    "GBPUSD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5, "spread_pips": 1.5},
-    "AUDUSD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5, "spread_pips": 1.2},
-    "USDCHF=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5, "spread_pips": 1.5},
-    "USDCAD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0 / 1.36, "type": "forex", "decimals": 5, "spread_pips": 1.5},
-    # v4: Gold corrected - 0.10 move = 1 pip (10 pips per $1 move)
-    "GC=F": {"pip_multiplier": 10, "pip_value_per_lot": 10.0, "type": "commodity", "decimals": 2, "spread_pips": 3.0},
+    "EURUSD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5},
+    "USDJPY=X": {"pip_multiplier": 100, "pip_value_per_lot": 1000 / 150, "type": "forex", "decimals": 3},
+    "GBPUSD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5},
+    "AUDUSD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5},
+    "USDCHF=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0, "type": "forex", "decimals": 5},
+    "USDCAD=X": {"pip_multiplier": 10000, "pip_value_per_lot": 10.0 / 1.36, "type": "forex", "decimals": 5},
+    "GC=F": {"pip_multiplier": 10, "pip_value_per_lot": 10.0, "type": "commodity", "decimals": 2},
 }
 
-# yfinance period limits by interval
 YFINANCE_LIMITS = {
     "1d": {"max_period": "2y", "max_days": 730},
     "4h": {"max_period": "60d", "max_days": 60},
     "1h": {"max_period": "730d", "max_days": 730},
-    "15m": {"max_period": "60d", "max_days": 60},
-    "5m": {"max_period": "60d", "max_days": 60},
 }
 
 DB_FILE = "signals.db"
@@ -167,9 +143,8 @@ def get_config() -> Config:
 def update_config(**kwargs):
     st.session_state.config.update(kwargs)
 
-
 # ────────────────────────────────────────────────
-# DATABASE (EXPANDED SCHEMA v4)
+# DATABASE
 # ────────────────────────────────────────────────
 
 @contextmanager
@@ -235,7 +210,6 @@ def init_db():
 
 
 def _migrate_db(conn):
-    """Add new columns to existing tables if needed."""
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(signals)")
     existing_cols = {row[1] for row in cursor.fetchall()}
@@ -261,18 +235,6 @@ def _migrate_db(conn):
         if col_name not in existing_cols:
             try:
                 conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
-            except Exception:
-                pass
-    
-    # Migrate backtest_results table
-    cursor.execute("PRAGMA table_info(backtest_results)")
-    bt_cols = {row[1] for row in cursor.fetchall()}
-    
-    bt_new_cols = [("avg_mae", "REAL"), ("avg_mfe", "REAL"), ("profit_factor", "REAL")]
-    for col_name, col_type in bt_new_cols:
-        if col_name not in bt_cols:
-            try:
-                conn.execute(f"ALTER TABLE backtest_results ADD COLUMN {col_name} {col_type}")
             except Exception:
                 pass
     
@@ -306,21 +268,6 @@ def save_signal(sig: Dict):
             sig.get("close_price"), sig.get("pnl_pips"), sig.get("mae_pips"),
             sig.get("mfe_pips"), sig.get("hold_bars"), datetime.utcnow().isoformat()
         ))
-        conn.commit()
-
-
-def update_signal_outcome(signal_id: str, outcome: str, close_price: float, 
-                          pnl_pips: float, mae_pips: float, mfe_pips: float, hold_bars: int):
-    """Update signal with backtest outcome."""
-    with get_db() as conn:
-        status = "closed" if outcome in ["win", "loss"] else "active"
-        conn.execute("""
-        UPDATE signals 
-        SET status = ?, outcome = ?, close_price = ?, close_time = ?, 
-            pnl_pips = ?, mae_pips = ?, mfe_pips = ?, hold_bars = ?
-        WHERE id = ?
-        """, (status, outcome, close_price, datetime.utcnow().isoformat(), 
-              pnl_pips, mae_pips, mfe_pips, hold_bars, signal_id))
         conn.commit()
 
 
@@ -371,7 +318,6 @@ def load_backtest_history() -> pd.DataFrame:
     with get_db() as conn:
         return pd.read_sql("SELECT * FROM backtest_results ORDER BY run_time DESC LIMIT 20", conn)
 
-
 # ────────────────────────────────────────────────
 # TIMEZONE NORMALIZATION
 # ────────────────────────────────────────────────
@@ -386,9 +332,8 @@ def normalize_to_utc(df: pd.DataFrame) -> pd.DataFrame:
         df.index = df.index.tz_convert("UTC").tz_localize(None)
     return df
 
-
 # ────────────────────────────────────────────────
-# DATA FETCH (v4: with 5m option for pricing)
+# DATA FETCH
 # ────────────────────────────────────────────────
 
 def check_yfinance_limits(interval: str, lookback_days: int) -> Tuple[bool, str]:
@@ -428,7 +373,6 @@ def fetch_data(symbol: str, interval: str) -> Optional[pd.DataFrame]:
             if rows:
                 df = pd.DataFrame(rows).set_index("time")
                 df = normalize_to_utc(df)
-                logger.info(f"OANDA: {symbol} {interval} → {len(df)} bars")
         except Exception as e:
             logger.warning(f"OANDA fetch failed for {symbol}: {e}")
             df = None
@@ -449,49 +393,11 @@ def fetch_data(symbol: str, interval: str) -> Optional[pd.DataFrame]:
             df = df[["Open", "High", "Low", "Close"]].copy()
             df.columns = ["open", "high", "low", "close"]
             df = normalize_to_utc(df)
-            logger.info(f"yfinance: {symbol} {interval} → {len(df)} bars")
         except Exception as e:
             logger.warning(f"yfinance fetch failed for {symbol}: {e}")
             return None
 
     return df
-
-
-def test_oanda_connection() -> Dict:
-    """Test OANDA connection and return diagnostic info."""
-    results = {
-        "connected": st.session_state.oanda_available,
-        "api_object": st.session_state.oanda_api is not None,
-        "account_id": st.session_state.oanda_account_id,
-        "test_results": []
-    }
-    
-    if not st.session_state.oanda_api:
-        results["error"] = "No API object"
-        return results
-    
-    # Test with EUR_USD
-    test_instrument = "EUR_USD"
-    try:
-        params = {"count": 10, "granularity": "H4", "price": "M"}
-        r = InstrumentsCandles(instrument=test_instrument, params=params)
-        resp = st.session_state.oanda_api.request(r)
-        candles = resp.get("candles", [])
-        results["test_results"].append({
-            "instrument": test_instrument,
-            "candles_received": len(candles),
-            "status": "✅ OK" if candles else "❌ No data"
-        })
-        if candles:
-            results["sample_candle"] = candles[0]
-    except Exception as e:
-        results["test_results"].append({
-            "instrument": test_instrument,
-            "status": f"❌ Error: {str(e)}"
-        })
-        results["error"] = str(e)
-    
-    return results
 
 
 def fetch_data_for_pair(pair: str, htf: str, ltf: str) -> Tuple[str, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
@@ -500,10 +406,9 @@ def fetch_data_for_pair(pair: str, htf: str, ltf: str) -> Tuple[str, Optional[pd
 
 
 def get_current_price(symbol: str) -> Optional[float]:
-    """Fetch current price - prefers OANDA pricing, then 5m candle, then 1h."""
+    """Fetch the current/latest price for a symbol."""
     instrument = INSTRUMENT_MAP.get(symbol)
     
-    # Try OANDA pricing endpoint
     if st.session_state.oanda_api and instrument and st.session_state.oanda_account_id:
         try:
             params = {"instruments": instrument}
@@ -514,18 +419,9 @@ def get_current_price(symbol: str) -> Optional[float]:
                 bid = float(prices[0]["bids"][0]["price"])
                 ask = float(prices[0]["asks"][0]["price"])
                 return (bid + ask) / 2
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"OANDA pricing failed for {symbol}: {e}")
     
-    # v4: Try 5m candle for more recent price
-    try:
-        df = fetch_data(symbol, "5m")
-        if df is not None and not df.empty:
-            return df["close"].iloc[-1]
-    except Exception:
-        pass
-    
-    # Fallback to 1h
     try:
         df = fetch_data(symbol, "1h")
         if df is not None and not df.empty:
@@ -555,8 +451,8 @@ def get_current_prices_batch(symbols: List[str]) -> Dict[str, float]:
                         bid = float(price_data["bids"][0]["price"])
                         ask = float(price_data["asks"][0]["price"])
                         prices[symbol] = (bid + ask) / 2
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"OANDA batch pricing failed: {e}")
     
     for symbol in symbols:
         if symbol not in prices:
@@ -565,7 +461,6 @@ def get_current_prices_batch(symbols: List[str]) -> Dict[str, float]:
                 prices[symbol] = price
     
     return prices
-
 
 # ────────────────────────────────────────────────
 # INDICATORS
@@ -577,9 +472,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
+    # EMAs
     for span, name in [(9, "ema_fast"), (21, "ema_slow"), (50, "ema_tf"), (200, "ema_ts")]:
         df[name] = df["close"].ewm(span=span, adjust=False).mean()
 
+    # ATR
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
@@ -587,6 +484,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
+    # ADX and DI
     up = df["high"].diff()
     down = -df["low"].diff()
     plus_dm = np.where((up > down) & (up > 0), up, 0)
@@ -597,18 +495,21 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     dx = 100 * (df["plus_di"] - df["minus_di"]).abs() / (df["plus_di"] + df["minus_di"])
     df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
 
+    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
+    # Trend direction
     df["trend"] = np.where(df["ema_fast"] > df["ema_slow"], "bullish",
                            np.where(df["ema_fast"] < df["ema_slow"], "bearish", "neutral"))
+
+    # ATR ratio
     df["atr_ratio"] = (df["atr"] / df["close"]) * 100
 
     return df
-
 
 # ────────────────────────────────────────────────
 # POSITION SIZING
@@ -632,11 +533,9 @@ def calculate_position_size(symbol: str, entry: float, sl: float, risk_usd: floa
         return units
 
     elif specs["type"] == "commodity":
-        # v4: Gold corrected - pip_multiplier=10 means 0.1 move = 1 pip
         sl_pips = sl_distance * specs["pip_multiplier"]
         if sl_pips == 0:
             return 0
-        # For gold: $1 per pip per 1oz, standard lot = 100oz
         pip_value_per_unit = specs["pip_value_per_lot"] / 100
         units = int(risk_usd / (sl_pips * pip_value_per_unit))
         return max(units, 0)
@@ -660,16 +559,13 @@ def format_position_size(symbol: str, units: int) -> str:
 
 
 def price_to_pips(symbol: str, price_distance: float) -> float:
-    """Convert price distance to pips."""
     specs = INSTRUMENT_SPECS.get(symbol, {"pip_multiplier": 10000})
     return price_distance * specs["pip_multiplier"]
 
 
 def pips_to_price(symbol: str, pips: float) -> float:
-    """Convert pips to price distance."""
     specs = INSTRUMENT_SPECS.get(symbol, {"pip_multiplier": 10000})
     return pips / specs["pip_multiplier"]
-
 
 # ────────────────────────────────────────────────
 # SIGNAL ID GENERATION
@@ -679,7 +575,6 @@ def generate_signal_id(symbol: str, direction: str, timestamp: pd.Timestamp) -> 
     ts_str = timestamp.strftime('%Y%m%d_%H%M%S')
     random_suffix = f"{int(time.time() * 1000) % 10000:04d}_{random.randint(1000, 9999)}"
     return f"{symbol}_{direction}_{ts_str}_{random_suffix}"
-
 
 # ────────────────────────────────────────────────
 # SIGNAL GENERATION
@@ -767,97 +662,6 @@ def generate_signal(htf: pd.DataFrame, ltf: pd.DataFrame, symbol: str) -> Option
         "status": "active",
     }
 
-
-def generate_signal_with_reason(htf: pd.DataFrame, ltf: pd.DataFrame, symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Generate signal and return (signal, rejection_reason).
-    If signal is generated, rejection_reason is None.
-    If rejected, signal is None and rejection_reason explains why.
-    """
-    cfg = get_config()
-
-    if htf.empty or ltf.empty:
-        return None, "empty_data"
-
-    htf_last = htf.iloc[-1]
-    ltf_last = ltf.iloc[-1]
-
-    htf_trend = htf_last.get("trend", "neutral")
-    if htf_trend == "neutral":
-        return None, "neutral_trend"
-
-    adx_val = ltf_last.get("adx", 0)
-    if pd.isna(adx_val) or adx_val < cfg.MIN_ADX:
-        return None, "low_adx"
-
-    atr_ratio = ltf_last.get("atr_ratio", 0)
-    if pd.isna(atr_ratio) or atr_ratio < cfg.MIN_ATR_RATIO_PCT:
-        return None, "low_atr_ratio"
-
-    direction = None
-    if htf_trend == "bullish":
-        if cfg.ENABLE_DI_CONFIRM:
-            if ltf_last.get("plus_di", 0) <= ltf_last.get("minus_di", 0):
-                return None, "di_confirm_fail"
-        if cfg.ENABLE_RSI_FILTER:
-            if ltf_last.get("rsi", 50) > 70:
-                return None, "rsi_overbought"
-        direction = "LONG"
-    elif htf_trend == "bearish":
-        if cfg.ENABLE_DI_CONFIRM:
-            if ltf_last.get("minus_di", 0) <= ltf_last.get("plus_di", 0):
-                return None, "di_confirm_fail"
-        if cfg.ENABLE_RSI_FILTER:
-            if ltf_last.get("rsi", 50) < 30:
-                return None, "rsi_oversold"
-        direction = "SHORT"
-
-    if direction is None:
-        return None, "no_direction"
-
-    if cfg.ENABLE_PULLBACK_FILTER:
-        atr = ltf_last.get("atr", 0)
-        ema_slow = ltf_last.get("ema_slow", ltf_last["close"])
-        pullback_dist = abs(ltf_last["close"] - ema_slow)
-        if atr > 0 and pullback_dist > cfg.PULLBACK_ATR_MAX * atr:
-            return None, "pullback_filter_fail"
-
-    entry = ltf_last["close"]
-    atr = ltf_last.get("atr", entry * 0.01)
-
-    if direction == "LONG":
-        sl = entry - (cfg.ATR_SL_MULT * atr)
-        tp = entry + (cfg.ATR_SL_MULT * atr * cfg.TARGET_RR)
-    else:
-        sl = entry + (cfg.ATR_SL_MULT * atr)
-        tp = entry - (cfg.ATR_SL_MULT * atr * cfg.TARGET_RR)
-
-    risk_amount = cfg.ACCOUNT_SIZE_USD * cfg.RISK_PER_TRADE_PCT
-    units = calculate_position_size(symbol, entry, sl, risk_amount)
-    confidence = min(100, (adx_val / cfg.MIN_ADX) * 50 + (atr_ratio / cfg.MIN_ATR_RATIO_PCT) * 25)
-    signal_id = generate_signal_id(symbol, direction, ltf.index[-1])
-
-    signal = {
-        "id": signal_id,
-        "symbol_raw": symbol,
-        "instrument": INSTRUMENT_MAP.get(symbol, symbol),
-        "direction": direction,
-        "entry": round(entry, 5),
-        "sl": round(sl, 5),
-        "tp": round(tp, 5),
-        "units": units,
-        "units_formatted": format_position_size(symbol, units),
-        "open_time": ltf.index[-1].isoformat(),
-        "confidence": round(confidence, 1),
-        "adx": round(adx_val, 1),
-        "atr_ratio": round(atr_ratio, 3),
-        "rsi": round(ltf_last.get("rsi", 50), 1),
-        "status": "active",
-    }
-    
-    return signal, None
-
-
 # ────────────────────────────────────────────────
 # MARKET CONTEXT
 # ────────────────────────────────────────────────
@@ -917,17 +721,13 @@ def add_market_context(df: pd.DataFrame) -> pd.DataFrame:
     context_df = df.apply(calc_context, axis=1)
     return pd.concat([df, context_df], axis=1)
 
-
 # ────────────────────────────────────────────────
-# BACKTEST ENGINE (v4: Realistic)
+# BACKTEST ENGINE
 # ────────────────────────────────────────────────
 
 def backtest_signal(signal: Dict, future_data: pd.DataFrame, 
                     spread_pips: float = 1.5, slippage_pips: float = 0.5,
                     max_hold_bars: int = None) -> Dict:
-    """
-    v4: Realistic backtest with spread, slippage, MAE/MFE tracking.
-    """
     if future_data.empty:
         return {
             "outcome": "open", "exit_price": None, "pnl_pips": 0,
@@ -940,34 +740,29 @@ def backtest_signal(signal: Dict, future_data: pd.DataFrame,
     direction = signal["direction"]
     symbol = signal["symbol_raw"]
     
-    # v4: Get instrument-specific spread if available
     specs = INSTRUMENT_SPECS.get(symbol, {})
     actual_spread = specs.get("spread_pips", spread_pips)
     total_cost_pips = actual_spread + slippage_pips
     
-    # v4: Adjust SL/TP for spread and slippage
     spread_price = pips_to_price(symbol, total_cost_pips)
     
     if direction == "LONG":
-        effective_sl = sl - pips_to_price(symbol, slippage_pips)  # SL hit worse due to slippage
-        effective_tp = tp - pips_to_price(symbol, actual_spread)  # TP hit at bid (minus spread)
+        effective_sl = sl - pips_to_price(symbol, slippage_pips)
+        effective_tp = tp - pips_to_price(symbol, actual_spread)
     else:
         effective_sl = sl + pips_to_price(symbol, slippage_pips)
         effective_tp = tp + pips_to_price(symbol, actual_spread)
     
-    # v4: Limit future data to max hold period
     if max_hold_bars and len(future_data) > max_hold_bars:
         future_data = future_data.iloc[:max_hold_bars]
     
-    # Track MAE (max adverse excursion) and MFE (max favorable excursion)
-    mae = 0  # Worst drawdown in pips
-    mfe = 0  # Best profit in pips
+    mae = 0
+    mfe = 0
     
     for bar_idx, (idx, row) in enumerate(future_data.iterrows()):
         high = row["high"]
         low = row["low"]
         
-        # Calculate excursions
         if direction == "LONG":
             current_favorable = high - entry
             current_adverse = entry - low
@@ -978,7 +773,6 @@ def backtest_signal(signal: Dict, future_data: pd.DataFrame,
         mfe = max(mfe, price_to_pips(symbol, current_favorable))
         mae = max(mae, price_to_pips(symbol, current_adverse))
         
-        # Check SL/TP hits
         if direction == "LONG":
             if low <= effective_sl:
                 pnl_pips = price_to_pips(symbol, effective_sl - entry)
@@ -1014,7 +808,6 @@ def backtest_signal(signal: Dict, future_data: pd.DataFrame,
                     "hold_bars": bar_idx + 1
                 }
     
-    # Trade still open - calculate current P&L
     last_close = future_data["close"].iloc[-1]
     if direction == "LONG":
         pnl_pips = price_to_pips(symbol, last_close - entry) - total_cost_pips
@@ -1030,7 +823,6 @@ def backtest_signal(signal: Dict, future_data: pd.DataFrame,
 
 
 def calculate_backtest_stats(signals: List[Dict], data_cache: Dict[str, pd.DataFrame]) -> Dict:
-    """Calculate backtest statistics with MAE/MFE."""
     cfg = get_config()
     
     if not signals:
@@ -1038,7 +830,7 @@ def calculate_backtest_stats(signals: List[Dict], data_cache: Dict[str, pd.DataF
             "total_signals": 0, "wins": 0, "losses": 0, "open": 0,
             "win_rate": 0, "avg_rr": 0, "total_pips": 0,
             "avg_pips_per_trade": 0, "profit_factor": 0,
-            "avg_mae": 0, "avg_mfe": 0,
+            "avg_mae": 0, "avg_mfe": 0, "gross_profit": 0, "gross_loss": 0,
             "avg_hold_bars": 0, "signals_with_outcomes": []
         }
     
@@ -1047,7 +839,6 @@ def calculate_backtest_stats(signals: List[Dict], data_cache: Dict[str, pd.DataF
     total_mae = total_mfe = total_hold_bars = 0
     signals_with_outcomes = []
     
-    # Convert max hold days to bars (approximate)
     bars_per_day = {"1d": 1, "4h": 6, "1h": 24}.get(cfg.LTF, 6)
     max_hold_bars = cfg.MAX_HOLD_DAYS * bars_per_day
     
@@ -1112,18 +903,13 @@ def calculate_backtest_stats(signals: List[Dict], data_cache: Dict[str, pd.DataF
         "signals_with_outcomes": signals_with_outcomes
     }
 
-
 # ────────────────────────────────────────────────
-# WIN PROBABILITY (v4: Calibrated)
+# WIN PROBABILITY
 # ────────────────────────────────────────────────
 
 def estimate_win_probability(signal: Dict, historical_stats: Dict = None) -> float:
-    """
-    v4: Calibrated win probability - capped at 65% unless very strong setup.
-    """
-    base_prob = 45.0  # Start conservative
+    base_prob = 45.0
     
-    # ADX contribution (max +15%)
     adx = signal.get("adx", 20)
     if adx >= 40:
         base_prob += 15
@@ -1132,166 +918,102 @@ def estimate_win_probability(signal: Dict, historical_stats: Dict = None) -> flo
     elif adx >= 25:
         base_prob += 5
     
-    # RSI contribution - favor middle range (max +5%)
     rsi = signal.get("rsi", 50)
     if 40 <= rsi <= 60:
         base_prob += 5
     elif rsi < 25 or rsi > 75:
         base_prob -= 5
     
-    # Confidence contribution (max +5%)
     confidence = signal.get("confidence", 50)
     if confidence >= 75:
         base_prob += 5
     elif confidence >= 60:
         base_prob += 2
     
-    # Historical calibration (weighted blend)
     if historical_stats and historical_stats.get("win_rate", 0) > 0:
         hist_rate = historical_stats["win_rate"]
-        # Only boost if historical is strong AND current setup is decent
         if hist_rate >= 55 and adx >= 30:
             base_prob = base_prob * 0.5 + hist_rate * 0.5
         else:
             base_prob = base_prob * 0.7 + hist_rate * 0.3
     
-    # v4: Hard cap at 65% unless exceptional setup
     max_prob = 65.0
     if adx >= 40 and historical_stats and historical_stats.get("win_rate", 0) >= 60:
-        max_prob = 70.0  # Allow up to 70% for exceptional setups
+        max_prob = 70.0
     
     return max(20, min(max_prob, round(base_prob, 1)))
 
-
 # ────────────────────────────────────────────────
-# LIVE SCAN (v4: Parallel)
+# LIVE SCAN
 # ────────────────────────────────────────────────
 
 def run_scan() -> Tuple[List[Dict], float]:
-    """Run live scan with optional parallel fetching."""
     cfg = get_config()
     results = []
     start_time = time.time()
-    
-    if cfg.ENABLE_PARALLEL_SCAN:
-        # Parallel data fetching
-        pair_data = {}
-        with ThreadPoolExecutor(max_workers=cfg.MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(fetch_data_for_pair, pair, cfg.HTF, cfg.LTF): pair 
-                for pair in PAIRS
-            }
-            for future in as_completed(futures):
-                try:
-                    pair, htf, ltf = future.result()
-                    pair_data[pair] = (htf, ltf)
-                except Exception as e:
-                    logger.warning(f"Parallel fetch failed: {e}")
-        
-        # Process results
-        for pair, (htf, ltf) in pair_data.items():
-            signal = _process_pair_for_signal(pair, htf, ltf, cfg)
+
+    for pair in PAIRS:
+        try:
+            htf = fetch_data(pair, cfg.HTF)
+            ltf = fetch_data(pair, cfg.LTF)
+
+            if htf is None or ltf is None:
+                continue
+            if htf.empty or ltf.empty:
+                continue
+            if len(htf) < cfg.MIN_BARS or len(ltf) < cfg.MIN_BARS:
+                continue
+
+            htf = compute_indicators(htf)
+            ltf = compute_indicators(ltf)
+            htf = htf.dropna()
+            ltf = ltf.dropna()
+
+            if ltf.empty:
+                continue
+
+            signal = generate_signal(htf, ltf, pair)
+
             if signal:
+                signal["win_prob"] = estimate_win_probability(signal)
                 results.append(signal)
                 save_signal(signal)
-    else:
-        # Sequential scanning
-        for pair in PAIRS:
-            try:
-                htf = fetch_data(pair, cfg.HTF)
-                ltf = fetch_data(pair, cfg.LTF)
-                signal = _process_pair_for_signal(pair, htf, ltf, cfg)
-                if signal:
-                    results.append(signal)
-                    save_signal(signal)
-            except Exception as e:
-                logger.exception(f"{pair}: scan failed → {e}")
-    
+
+        except Exception as e:
+            logger.exception(f"{pair}: scan failed → {e}")
+
     duration = time.time() - start_time
     return results, duration
 
-
-def _process_pair_for_signal(pair: str, htf: pd.DataFrame, ltf: pd.DataFrame, cfg: Config) -> Optional[Dict]:
-    """Process a single pair and return signal if valid."""
-    if htf is None or ltf is None:
-        return None
-    if htf.empty or ltf.empty:
-        return None
-    if len(htf) < cfg.MIN_BARS or len(ltf) < cfg.MIN_BARS:
-        return None
-    
-    htf = compute_indicators(htf)
-    ltf = compute_indicators(ltf)
-    htf = htf.dropna()
-    ltf = ltf.dropna()
-    
-    if ltf.empty:
-        return None
-    
-    signal = generate_signal(htf, ltf, pair)
-    if signal:
-        signal["win_prob"] = estimate_win_probability(signal)
-    return signal
-
-
 # ────────────────────────────────────────────────
-# HISTORICAL SCAN (v4: Optimized)
+# HISTORICAL SCAN
 # ────────────────────────────────────────────────
 
 def run_historical_scan(lookback_days: int) -> Tuple[List[Dict], Dict, List[str], Dict, float]:
-    """Run historical scan with backtest."""
     cfg = get_config()
     signals = []
     rejections = {}
     warnings = []
     data_cache = {}
     start_time = time.time()
-    
-    # Track signal generation rejections
-    filter_rejections = {
-        "no_data": 0, "empty_df": 0, "not_enough_bars": 0,
-        "nan_after_indicators": 0, "no_recent_data": 0,
-        "neutral_trend": 0, "low_adx": 0, "low_atr_ratio": 0,
-        "di_confirm_fail": 0, "rsi_filter_fail": 0, "pullback_filter_fail": 0,
-        "no_htf_alignment": 0, "exception": 0
-    }
 
     if not st.session_state.oanda_available:
         is_ok, warning = check_yfinance_limits(cfg.LTF, lookback_days)
         if not is_ok:
             warnings.append(f"⚠️ {warning}")
 
-    # v4: Parallel data fetching
-    pair_data = {}
-    if cfg.ENABLE_PARALLEL_SCAN:
-        with ThreadPoolExecutor(max_workers=cfg.MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(fetch_data_for_pair, pair, cfg.HTF, cfg.LTF): pair 
-                for pair in PAIRS
-            }
-            for future in as_completed(futures):
-                try:
-                    pair, htf, ltf = future.result()
-                    pair_data[pair] = (htf, ltf)
-                except Exception as e:
-                    logger.warning(f"Parallel fetch error: {e}")
-    else:
-        for pair in PAIRS:
-            pair_data[pair] = (fetch_data(pair, cfg.HTF), fetch_data(pair, cfg.LTF))
-
     for pair in PAIRS:
         rejections[pair] = {}
-        
+
         try:
-            htf, ltf = pair_data.get(pair, (None, None))
-            
+            htf = fetch_data(pair, cfg.HTF)
+            ltf = fetch_data(pair, cfg.LTF)
+
             if htf is None or ltf is None:
                 rejections[pair]["no_data"] = 1
-                filter_rejections["no_data"] += 1
                 continue
             if htf.empty or ltf.empty:
                 rejections[pair]["empty_df"] = 1
-                filter_rejections["empty_df"] += 1
                 continue
 
             if not isinstance(ltf.index, pd.DatetimeIndex):
@@ -1304,7 +1026,6 @@ def run_historical_scan(lookback_days: int) -> Tuple[List[Dict], Dict, List[str]
 
             if len(ltf) < cfg.MIN_BARS or len(htf) < cfg.MIN_BARS:
                 rejections[pair]["not_enough_bars"] = 1
-                filter_rejections["not_enough_bars"] += 1
                 continue
 
             htf = compute_indicators(htf)
@@ -1314,7 +1035,6 @@ def run_historical_scan(lookback_days: int) -> Tuple[List[Dict], Dict, List[str]
 
             if ltf.empty:
                 rejections[pair]["nan_after_indicators"] = 1
-                filter_rejections["nan_after_indicators"] += 1
                 continue
 
             data_cache[pair] = ltf
@@ -1325,7 +1045,6 @@ def run_historical_scan(lookback_days: int) -> Tuple[List[Dict], Dict, List[str]
 
             if recent.empty:
                 rejections[pair]["no_recent_data"] = 1
-                filter_rejections["no_recent_data"] += 1
                 continue
 
             step = cfg.HIST_SCAN_STEP
@@ -1333,37 +1052,22 @@ def run_historical_scan(lookback_days: int) -> Tuple[List[Dict], Dict, List[str]
             if len(recent) - 1 not in indices:
                 indices.append(len(recent) - 1)
 
-            bars_checked = 0
             for i in indices:
-                bars_checked += 1
                 sub_ltf = recent.iloc[: i + 1].copy()
                 sub_htf = htf[htf.index <= sub_ltf.index[-1]].copy()
 
                 if sub_htf.empty:
-                    filter_rejections["no_htf_alignment"] += 1
                     continue
 
-                signal, rejection_reason = generate_signal_with_reason(sub_htf, sub_ltf, pair)
+                signal = generate_signal(sub_htf, sub_ltf, pair)
                 if signal:
                     signals.append(signal)
-                elif rejection_reason:
-                    filter_rejections[rejection_reason] = filter_rejections.get(rejection_reason, 0) + 1
-            
-            # Store bars checked for debugging
-            rejections[pair]["bars_checked"] = bars_checked
 
         except Exception as e:
             rejections[pair]["exception"] = 1
-            filter_rejections["exception"] += 1
             logger.exception(f"{pair}: historical scan failed → {e}")
 
-    # Add filter rejections summary to warnings for visibility
-    active_rejections = {k: v for k, v in filter_rejections.items() if v > 0}
-    if active_rejections and not signals:
-        warnings.append(f"Filter rejections: {active_rejections}")
-
     backtest_stats = calculate_backtest_stats(signals, data_cache)
-    backtest_stats["filter_rejections"] = filter_rejections
     
     for signal in backtest_stats["signals_with_outcomes"]:
         signal["win_prob"] = estimate_win_probability(signal, backtest_stats)
@@ -1387,63 +1091,6 @@ def run_historical_scan(lookback_days: int) -> Tuple[List[Dict], Dict, List[str]
     return signals, rejections, warnings, backtest_stats, duration
 
 
-# ────────────────────────────────────────────────
-# UPDATE OUTCOMES (v4: New feature)
-# ────────────────────────────────────────────────
-
-def update_active_signal_outcomes() -> Tuple[int, int]:
-    """
-    Re-evaluate active signals against latest data.
-    Returns (updated_count, still_open_count).
-    """
-    cfg = get_config()
-    active_signals = load_signals(status_filter="active")
-    
-    if active_signals.empty:
-        return 0, 0
-    
-    updated = 0
-    still_open = 0
-    
-    # Get max hold bars
-    bars_per_day = {"1d": 1, "4h": 6, "1h": 24}.get(cfg.LTF, 6)
-    max_hold_bars = cfg.MAX_HOLD_DAYS * bars_per_day
-    
-    for _, row in active_signals.iterrows():
-        symbol = row["symbol_raw"]
-        signal_time = pd.to_datetime(row["open_time"])
-        
-        # Fetch latest data
-        ltf = fetch_data(symbol, cfg.LTF)
-        if ltf is None or ltf.empty:
-            continue
-        
-        ltf = compute_indicators(ltf)
-        ltf = ltf.dropna()
-        
-        future_data = ltf[ltf.index > signal_time]
-        
-        signal_dict = row.to_dict()
-        result = backtest_signal(
-            signal_dict, future_data,
-            spread_pips=cfg.SPREAD_PIPS,
-            slippage_pips=cfg.SLIPPAGE_PIPS,
-            max_hold_bars=max_hold_bars
-        )
-        
-        if result["outcome"] in ["win", "loss"]:
-            update_signal_outcome(
-                row["id"], result["outcome"], result["exit_price"],
-                result["pnl_pips"], result["mae_pips"], result["mfe_pips"],
-                result["hold_bars"]
-            )
-            updated += 1
-        else:
-            still_open += 1
-    
-    return updated, still_open
-
-
 def build_rejection_heatmap(rejections: Dict) -> pd.DataFrame:
     all_reasons = set()
     for pair_rej in rejections.values():
@@ -1461,75 +1108,14 @@ def build_rejection_heatmap(rejections: Dict) -> pd.DataFrame:
         df = df.set_index("pair")
     return df
 
-
-def format_dataframe_decimals(df: pd.DataFrame, decimal_places: int = 2) -> pd.DataFrame:
-    """
-    Format all numeric columns in a dataframe to specified decimal places.
-    """
-    if df.empty:
-        return df
-    
-    df = df.copy()
-    
-    for col in df.columns:
-        if df[col].dtype in ['float64', 'float32', 'float']:
-            df[col] = df[col].round(decimal_places)
-    
-    return df
-
-
-# Columns that should have 5 decimal places (price-related)
-PRICE_COLUMNS = {'entry', 'sl', 'tp', 'current_price', 'close_price', 'exit_price'}
-
-# Columns that should have 1 decimal place (pips, percentages, scores)  
-ONE_DECIMAL_COLUMNS = {'pnl_pips', 'mae_pips', 'mfe_pips', 'pips_to_sl', 'pips_to_tp', 
-                       'confidence', 'adx', 'rsi', 'win_prob', 'win_rate', 'pct_to_sl', 'pct_to_tp'}
-
-
-def style_dataframe(df: pd.DataFrame, direction_col: str = "direction", 
-                    outcome_col: str = "outcome") -> pd.io.formats.style.Styler:
-    """
-    Apply standard styling to dataframe:
-    - Price columns (entry, sl, tp, current_price): 5 decimal places
-    - Pip/score columns: 1 decimal place
-    - Other numeric: 2 decimal places
-    - Color direction (green LONG / red SHORT)
-    - Color outcome (green win / red loss)
-    """
-    if df.empty:
-        return df.style
-    
-    df = df.copy()
-    
-    # Apply styling
-    styler = df.style
-    
-    if direction_col in df.columns:
-        styler = styler.applymap(style_direction, subset=[direction_col])
-    
-    if outcome_col in df.columns and outcome_col in df.columns:
-        styler = styler.applymap(style_outcome, subset=[outcome_col])
-    
-    # Build format dictionary with appropriate decimal places per column
-    format_dict = {}
-    for col in df.columns:
-        if df[col].dtype in ['float64', 'float32', 'float']:
-            if col in PRICE_COLUMNS:
-                format_dict[col] = '{:.5f}'
-            elif col in ONE_DECIMAL_COLUMNS:
-                format_dict[col] = '{:.1f}'
-            else:
-                format_dict[col] = '{:.2f}'
-    
-    if format_dict:
-        styler = styler.format(format_dict)
-    
-    return styler
-
-
 # ────────────────────────────────────────────────
 # STYLING HELPERS
 # ────────────────────────────────────────────────
+
+PRICE_COLUMNS = {'entry', 'sl', 'tp', 'current_price', 'close_price', 'exit_price'}
+ONE_DECIMAL_COLUMNS = {'pnl_pips', 'mae_pips', 'mfe_pips', 'pips_to_sl', 'pips_to_tp', 
+                       'confidence', 'adx', 'rsi', 'win_prob', 'win_rate', 'pct_to_sl', 'pct_to_tp'}
+
 
 def style_direction(val):
     if val == "LONG":
@@ -1547,6 +1133,35 @@ def style_outcome(val):
     return ""
 
 
+def style_dataframe(df: pd.DataFrame, direction_col: str = "direction", 
+                    outcome_col: str = "outcome"):
+    if df.empty:
+        return df.style
+    
+    df = df.copy()
+    styler = df.style
+    
+    if direction_col in df.columns:
+        styler = styler.applymap(style_direction, subset=[direction_col])
+    
+    if outcome_col in df.columns and outcome_col in df.columns:
+        styler = styler.applymap(style_outcome, subset=[outcome_col])
+    
+    format_dict = {}
+    for col in df.columns:
+        if df[col].dtype in ['float64', 'float32', 'float']:
+            if col in PRICE_COLUMNS:
+                format_dict[col] = '{:.5f}'
+            elif col in ONE_DECIMAL_COLUMNS:
+                format_dict[col] = '{:.1f}'
+            else:
+                format_dict[col] = '{:.2f}'
+    
+    if format_dict:
+        styler = styler.format(format_dict)
+    
+    return styler
+
 # ────────────────────────────────────────────────
 # UI
 # ────────────────────────────────────────────────
@@ -1557,21 +1172,18 @@ st.title("📈 Trend Following Scanner v4")
 init_db()
 
 # Status bar
-col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+col_s1, col_s2, col_s3 = st.columns(3)
 with col_s1:
     if st.session_state.oanda_available:
-        st.success("✅ OANDA")
+        st.success("✅ OANDA Connected")
     else:
-        st.warning("⚠️ yfinance")
+        st.warning("⚠️ yfinance fallback")
 with col_s2:
     if st.session_state.last_scan_time:
-        st.info(f"🕐 {st.session_state.last_scan_time.strftime('%H:%M:%S')}")
+        st.info(f"🕐 Last: {st.session_state.last_scan_time.strftime('%H:%M:%S')}")
 with col_s3:
     if st.session_state.last_scan_duration:
         st.info(f"⏱️ {st.session_state.last_scan_duration:.1f}s")
-with col_s4:
-    cfg = get_config()
-    st.caption(f"Spread: {cfg.SPREAD_PIPS} | Slip: {cfg.SLIPPAGE_PIPS} pips")
 
 # Sidebar
 with st.sidebar:
@@ -1588,18 +1200,17 @@ with st.sidebar:
         di_confirm = st.checkbox("DI Confirmation", cfg.ENABLE_DI_CONFIRM)
         rsi_filter = st.checkbox("RSI Filter", cfg.ENABLE_RSI_FILTER)
         pullback_filter = st.checkbox("Pullback Filter", cfg.ENABLE_PULLBACK_FILTER)
-        parallel_scan = st.checkbox("Parallel Scan", cfg.ENABLE_PARALLEL_SCAN)
 
         if st.button("Update Scan Settings"):
             update_config(
                 MIN_ADX=min_adx, MIN_ATR_RATIO_PCT=min_atr, ATR_SL_MULT=atr_sl,
                 TARGET_RR=target_rr, HIST_SCAN_STEP=hist_step,
                 ENABLE_DI_CONFIRM=di_confirm, ENABLE_RSI_FILTER=rsi_filter,
-                ENABLE_PULLBACK_FILTER=pullback_filter, ENABLE_PARALLEL_SCAN=parallel_scan,
+                ENABLE_PULLBACK_FILTER=pullback_filter,
             )
             st.success("Updated!")
 
-    with st.expander("Backtest Realism (v4)", expanded=False):
+    with st.expander("Backtest Settings", expanded=False):
         spread_pips = st.slider("Spread (pips)", 0.0, 5.0, cfg.SPREAD_PIPS, 0.5)
         slippage_pips = st.slider("Slippage (pips)", 0.0, 3.0, cfg.SLIPPAGE_PIPS, 0.1)
         max_hold = st.slider("Max Hold (days)", 7, 90, cfg.MAX_HOLD_DAYS, 1)
@@ -1650,23 +1261,15 @@ with st.sidebar:
             st.session_state.hist_stats = stats
             st.session_state.last_scan_duration = duration
             st.session_state.last_scan_time = datetime.now()
-            
             if sigs:
-                st.success(f"✅ {len(sigs)} signals found")
+                st.success(f"✅ {len(sigs)} signals")
             else:
-                st.warning("No signals found - check rejections in Backtest tab")
+                st.warning("No signals - check Backtest tab")
 
     st.divider()
 
     # Signal management
     st.subheader("🗂️ Management")
-    
-    # v4: Update outcomes button
-    if st.button("🔄 Update Outcomes"):
-        with st.spinner("Updating..."):
-            updated, still_open = update_active_signal_outcomes()
-            st.success(f"Updated: {updated}, Open: {still_open}")
-    
     col_m1, col_m2 = st.columns(2)
     with col_m1:
         if st.button("Archive Old"):
@@ -1676,57 +1279,6 @@ with st.sidebar:
         if st.button("Delete Arch"):
             count = delete_archived_signals()
             st.success(f"Deleted: {count}")
-    
-    # v4: Refresh prices button
-    if st.button("🔄 Refresh Prices"):
-        st.session_state.price_refresh_time = datetime.now()
-        st.success("Prices will refresh on next view")
-    
-    st.divider()
-    
-    # Diagnostic section
-    with st.expander("🔧 Diagnostics"):
-        st.write(f"**OANDA Connected:** {st.session_state.oanda_available}")
-        st.write(f"**Account ID:** {st.session_state.oanda_account_id}")
-        st.write(f"**HTF:** {cfg.HTF}, **LTF:** {cfg.LTF}")
-        st.write(f"**MIN_BARS:** {cfg.MIN_BARS}, **MIN_ADX:** {cfg.MIN_ADX}")
-        
-        if st.button("🔌 Test OANDA Connection"):
-            with st.spinner("Testing OANDA..."):
-                test_result = test_oanda_connection()
-                st.json(test_result)
-        
-        if st.button("📊 Test Data Fetch"):
-            st.write("Testing data fetch for all pairs...")
-            results = []
-            for pair in PAIRS:
-                with st.spinner(f"Fetching {pair}..."):
-                    htf = fetch_data(pair, cfg.HTF)
-                    ltf = fetch_data(pair, cfg.LTF)
-                    htf_status = f"✅ {len(htf)} bars" if htf is not None and not htf.empty else "❌ Failed"
-                    ltf_status = f"✅ {len(ltf)} bars" if ltf is not None and not ltf.empty else "❌ Failed"
-                    results.append({
-                        "Pair": pair,
-                        "Instrument": INSTRUMENT_MAP.get(pair, "?"),
-                        f"HTF ({cfg.HTF})": htf_status,
-                        f"LTF ({cfg.LTF})": ltf_status
-                    })
-            st.dataframe(pd.DataFrame(results), use_container_width=True)
-        
-        if st.button("🧪 Test Single Pair (EUR_USD)"):
-            with st.spinner("Testing EUR_USD..."):
-                st.write("**Testing OANDA H4 fetch for EUR_USD...**")
-                try:
-                    params = {"count": 10, "granularity": "H4", "price": "M"}
-                    r = InstrumentsCandles(instrument="EUR_USD", params=params)
-                    resp = st.session_state.oanda_api.request(r)
-                    candles = resp.get("candles", [])
-                    st.write(f"Received {len(candles)} candles")
-                    if candles:
-                        st.write("**Sample candle:**")
-                        st.json(candles[0])
-                except Exception as e:
-                    st.error(f"Error: {e}")
 
 # Main tabs
 tab1, tab2, tab3, tab4 = st.tabs(["📈 Live", "📊 Backtest", "📋 Signals", "📉 Stats"])
@@ -1764,9 +1316,7 @@ with tab2:
     if "hist_stats" in st.session_state and st.session_state.hist_stats:
         stats = st.session_state.hist_stats
         
-        # Check if we have signals
         if stats["total_signals"] > 0:
-            # v4: Enhanced stats with MAE/MFE
             c1, c2, c3, c4, c5, c6 = st.columns(6)
             with c1:
                 st.metric("Signals", stats["total_signals"])
@@ -1781,13 +1331,12 @@ with tab2:
             with c6:
                 st.metric("Avg Hold", f"{stats.get('avg_hold_bars', 0)} bars")
             
-            # v4: MAE/MFE metrics
             st.divider()
             c_a, c_b, c_c, c_d = st.columns(4)
             with c_a:
-                st.metric("Avg MAE", f"{stats.get('avg_mae', 0)} pips", help="Max Adverse Excursion")
+                st.metric("Avg MAE", f"{stats.get('avg_mae', 0)} pips")
             with c_b:
-                st.metric("Avg MFE", f"{stats.get('avg_mfe', 0)} pips", help="Max Favorable Excursion")
+                st.metric("Avg MFE", f"{stats.get('avg_mfe', 0)} pips")
             with c_c:
                 st.metric("Gross Profit", f"{stats.get('gross_profit', 0)} pips")
             with c_d:
@@ -1807,50 +1356,7 @@ with tab2:
                 styled = style_dataframe(sig_df[cols], direction_col="direction", outcome_col="outcome")
                 st.dataframe(styled, use_container_width=True)
         else:
-            # No signals found - show filter rejection analysis
             st.warning("⚠️ No signals found in the historical scan")
-            
-            # Show filter rejections if available
-            if "filter_rejections" in stats:
-                st.subheader("🔍 Why no signals? Filter Rejection Analysis")
-                
-                filter_rej = stats["filter_rejections"]
-                active_rejections = {k: v for k, v in filter_rej.items() if v > 0}
-                
-                if active_rejections:
-                    # Create a nice display
-                    rej_df = pd.DataFrame([
-                        {"Filter": k, "Rejections": v} 
-                        for k, v in sorted(active_rejections.items(), key=lambda x: -x[1])
-                    ])
-                    st.dataframe(rej_df, use_container_width=True)
-                    
-                    # Provide suggestions based on rejections
-                    st.subheader("💡 Suggestions")
-                    suggestions = []
-                    
-                    if filter_rej.get("low_adx", 0) > 10:
-                        suggestions.append(f"• **Low ADX** ({filter_rej['low_adx']} rejections): Try lowering MIN_ADX from current value (markets may be ranging)")
-                    if filter_rej.get("low_atr_ratio", 0) > 10:
-                        suggestions.append(f"• **Low ATR Ratio** ({filter_rej['low_atr_ratio']} rejections): Try lowering MIN_ATR_RATIO_PCT (low volatility)")
-                    if filter_rej.get("di_confirm_fail", 0) > 10:
-                        suggestions.append(f"• **DI Confirmation** ({filter_rej['di_confirm_fail']} rejections): Try disabling ENABLE_DI_CONFIRM")
-                    if filter_rej.get("rsi_overbought", 0) + filter_rej.get("rsi_oversold", 0) > 10:
-                        suggestions.append(f"• **RSI Filter** rejections: Try disabling ENABLE_RSI_FILTER")
-                    if filter_rej.get("pullback_filter_fail", 0) > 10:
-                        suggestions.append(f"• **Pullback Filter** ({filter_rej['pullback_filter_fail']} rejections): Try disabling ENABLE_PULLBACK_FILTER or increasing PULLBACK_ATR_MAX")
-                    if filter_rej.get("neutral_trend", 0) > 10:
-                        suggestions.append(f"• **Neutral Trend** ({filter_rej['neutral_trend']} rejections): Markets may be sideways, no clear trend")
-                    if filter_rej.get("no_data", 0) > 0 or filter_rej.get("empty_df", 0) > 0:
-                        suggestions.append("• **Data Issues**: Check your OANDA API connection or try reducing lookback period")
-                    
-                    if suggestions:
-                        for s in suggestions:
-                            st.markdown(s)
-                    else:
-                        st.info("Filters are working normally, but market conditions didn't produce signals.")
-                else:
-                    st.info("No specific filter rejections recorded.")
     else:
         st.info("Run historical scan to see backtest results")
     
@@ -1880,9 +1386,9 @@ with tab3:
         if "current_price" in df.columns:
             cols.insert(5, "current_price")
         if "pips_to_sl" in df.columns:
-            cols.insert(cols.index("pnl_pips"), "pips_to_sl")
+            cols.insert(cols.index("pnl_pips") if "pnl_pips" in cols else len(cols), "pips_to_sl")
         if "pips_to_tp" in df.columns:
-            cols.insert(cols.index("pnl_pips"), "pips_to_tp")
+            cols.insert(cols.index("pnl_pips") if "pnl_pips" in cols else len(cols), "pips_to_tp")
         cols = [c for c in cols if c in df.columns]
         
         styled = style_dataframe(df[cols], direction_col="direction", outcome_col="outcome")
@@ -1906,24 +1412,20 @@ with tab4:
             st.divider()
             st.write("**By Direction**")
             st.bar_chart(all_sig["direction"].value_counts())
-            
-            st.write("**By Instrument**")
-            st.bar_chart(all_sig["instrument"].value_counts())
     
     with c2:
         st.subheader("Backtest History")
         bt_hist = load_backtest_history()
         if not bt_hist.empty:
             show_cols = ["run_time", "lookback_days", "total_signals", 
-                        "win_rate", "total_pips", "profit_factor", "avg_mae", "avg_mfe"]
+                        "win_rate", "total_pips", "profit_factor"]
             show_cols = [c for c in show_cols if c in bt_hist.columns]
-            formatted_hist = format_dataframe_decimals(bt_hist[show_cols], 2)
-            st.dataframe(formatted_hist, use_container_width=True)
+            st.dataframe(bt_hist[show_cols], use_container_width=True)
         else:
             st.info("No history")
     
     st.divider()
-    st.subheader("💰 Account")
+    st.subheader("💰 Account Settings")
     cfg = get_config()
     ca, cb, cc = st.columns(3)
     with ca:
@@ -1932,13 +1434,3 @@ with tab4:
         st.metric("Risk", f"{cfg.RISK_PER_TRADE_PCT * 100:.1f}%")
     with cc:
         st.metric("Risk $", f"${cfg.ACCOUNT_SIZE_USD * cfg.RISK_PER_TRADE_PCT:,.0f}")
-    
-    # v4: Backtest settings display
-    st.subheader("🎯 Backtest Settings")
-    cd, ce, cf = st.columns(3)
-    with cd:
-        st.metric("Spread", f"{cfg.SPREAD_PIPS} pips")
-    with ce:
-        st.metric("Slippage", f"{cfg.SLIPPAGE_PIPS} pips")
-    with cf:
-        st.metric("Max Hold", f"{cfg.MAX_HOLD_DAYS} days")

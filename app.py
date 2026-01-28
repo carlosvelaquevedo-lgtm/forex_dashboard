@@ -199,6 +199,7 @@ def init_db():
             adx REAL,
             atr_ratio REAL,
             rsi REAL,
+            win_prob REAL,
             status TEXT DEFAULT 'active',
             outcome TEXT,
             close_price REAL,
@@ -244,6 +245,7 @@ def _migrate_db(conn):
         ("adx", "REAL"),
         ("atr_ratio", "REAL"),
         ("rsi", "REAL"),
+        ("win_prob", "REAL"),
         ("status", "TEXT DEFAULT 'active'"),
         ("outcome", "TEXT"),
         ("close_price", "REAL"),
@@ -293,14 +295,14 @@ def save_signal(sig: Dict):
         conn.execute("""
         INSERT OR REPLACE INTO signals
         (id, symbol_raw, instrument, direction, entry, sl, tp, units, units_formatted,
-         open_time, confidence, adx, atr_ratio, rsi, status, outcome, close_price,
+         open_time, confidence, adx, atr_ratio, rsi, win_prob, status, outcome, close_price,
          pnl_pips, mae_pips, mfe_pips, hold_bars, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             sig["id"], sig["symbol_raw"], sig["instrument"], sig["direction"],
             sig["entry"], sig["sl"], sig["tp"], sig["units"], sig.get("units_formatted", ""),
             sig["open_time"], sig["confidence"], sig.get("adx"), sig.get("atr_ratio"),
-            sig.get("rsi"), sig.get("status", "active"), sig.get("outcome"),
+            sig.get("rsi"), sig.get("win_prob"), sig.get("status", "active"), sig.get("outcome"),
             sig.get("close_price"), sig.get("pnl_pips"), sig.get("mae_pips"),
             sig.get("mfe_pips"), sig.get("hold_bars"), datetime.utcnow().isoformat()
         ))

@@ -23,7 +23,8 @@ import logging
 import time
 import random
 from contextlib import contextmanager
-
+from pandas import DataFrame
+from pandas.io.formats.style import Styler
 import oandapyV20
 from oandapyV20 import API
 from oandapyV20.endpoints.instruments import InstrumentsCandles
@@ -1441,8 +1442,11 @@ ONE_DECIMAL_COLUMNS = {'pnl_pips', 'mae_pips', 'mfe_pips', 'pips_to_sl', 'pips_t
                        'confidence', 'adx', 'rsi', 'win_prob', 'win_rate', 'pct_to_sl', 'pct_to_tp'}
 
 
-def style_dataframe(df: pd.DataFrame, direction_col: str = "direction", 
-                    outcome_col: str = "outcome") -> pd.io.formats.style.Styler:
+def style_dataframe(
+    df: DataFrame,
+    direction_col: str = "direction",
+    outcome_col: str = "outcome"
+) -> Styler:
     """
     Apply standard styling to dataframe:
     - Price columns (entry, sl, tp, current_price): 5 decimal places
